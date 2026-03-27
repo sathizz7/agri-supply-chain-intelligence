@@ -1,4 +1,4 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -28,10 +28,15 @@ venv/
 myenv/
 ENV/
 env/
+env.bak/
+venv.bak/
 
 # IDE
 .vscode/
 .idea/
+.spyderproject
+.spyproject
+.ropeproject
 *.swp
 *.swo
 *~
@@ -39,6 +44,7 @@ env/
 # Environment variables
 .env
 .env.local
+.envrc
 
 # Logs
 logs/
@@ -48,16 +54,57 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+db.sqlite3
+db.sqlite3-journal
+
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Cache
-.pytest_cache/
-.mypy_cache/
-.coverage
-
 # Project-specific
 docs/failed_cards/
 inspect_site.py
+
+# Django
+local_settings.py
+
+# Flask
+instance/
+.webassets-cache
+
+# Sphinx
+docs/_build/
+
+# Jupyter
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Ruff
+.ruff_cache/
+
+# PyPI
+.pypirc
+
+# Cursor
+.cursorignore
+.cursorindexingignore
