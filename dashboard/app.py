@@ -320,8 +320,9 @@ elif page == "📉 Trends":
             st.subheader("Day-over-Day Change (%)")
             pivot = df.groupby(["date", "fertilizer_name"])["quantity"].sum().unstack(fill_value=0)
             pct_change = pivot.pct_change().tail(7) * 100
+            # Format as percentage (matplotlib not available, use simple styling)
             st.dataframe(
-                pct_change.style.format("{:.1f}%").background_gradient(cmap="RdYlGn", axis=None),
+                pct_change.style.format("{:.1f}%"),
                 use_container_width=True,
             )
 
@@ -425,13 +426,16 @@ elif page == "🔍 Dealer Intel":
     st.subheader("Browse Dealers by Block")
     df = fetch_stock(district_code=selected_district_code, scrape_date=date_str)
     if not df.empty:
+        # Select only columns that exist in the API response
+        cols = ["dealer_code", "dealer_name", "block_name", "district_name"]
+        if "contact" in df.columns:
+            cols.append("contact")
+
         dealer_list = (
-            df[["dealer_code", "dealer_name", "block_name", "district_name", "contact"]]
+            df[cols]
             .drop_duplicates(subset=["dealer_code"])
             .reset_index(drop=True)
         )
-        if "contact" not in dealer_list.columns:
-            dealer_list["contact"] = "—"
         st.dataframe(dealer_list, use_container_width=True, hide_index=True)
 
 
