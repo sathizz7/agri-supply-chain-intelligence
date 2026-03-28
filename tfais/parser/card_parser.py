@@ -193,6 +193,12 @@ class CardParser:
             return None
 
         json_str = raw[len("fert_list="):]
+
+        # The site sometimes embeds literal newlines inside JSON string values
+        # (e.g. "Neem Coated Urea(45\nKg)") which is invalid JSON.
+        # Collapse them to a space before parsing.
+        json_str = json_str.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
         try:
             data: dict = json.loads(json_str)
         except json.JSONDecodeError as exc:

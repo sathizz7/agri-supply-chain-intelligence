@@ -149,8 +149,8 @@ class Orchestrator:
 
         # Finalize run record
         with get_session() as session:
-            from tfais.database.models import ScrapeMetadata
-            run_obj = session.get(ScrapeMetadata, run_id)
+            from tfais.database.models import ScrapeRun
+            run_obj = session.get(ScrapeRun, run_id)
             if run_obj:
                 complete_scrape_run(
                     session,

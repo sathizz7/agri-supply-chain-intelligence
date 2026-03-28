@@ -23,7 +23,6 @@ from tfais.database.models import (
     Block,
     Dealer,
     District,
-    Fertilizer,
     FertilizerStock,
 )
 
@@ -42,7 +41,6 @@ class DistrictOut(BaseModel):
     id: int
     code: str
     name_ta: str
-    name_en: Optional[str]
 
     class Config:
         from_attributes = True
@@ -59,11 +57,10 @@ class BlockOut(BaseModel):
 
 
 class StockItem(BaseModel):
-    fertilizer_code: str
-    fertilizer_name_ta: Optional[str]
-    fertilizer_name_en: Optional[str]
-    quantity_kg: float
-    scraped_at: datetime
+    fertilizer_name: str
+    quantity: float
+    unit: str
+    scrape_date: date
 
 
 class DealerOut(BaseModel):
@@ -88,8 +85,9 @@ class StockRecord(BaseModel):
     district_code: str
     district_name: str
     fertilizer_name: str
-    quantity_kg: float
-    scraped_at: datetime
+    quantity: float             # quantity in kg
+    unit: str
+    scrape_date: date
 
 
 class DistrictSummary(BaseModel):
@@ -97,7 +95,7 @@ class DistrictSummary(BaseModel):
     district_name: str
     total_dealers: int
     total_stock_kg: float
-    last_scraped: Optional[datetime]
+    last_scraped: Optional[date]
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +107,7 @@ def list_districts():
     """List all districts."""
     with get_session() as session:
         districts = session.scalars(select(District).order_by(District.code)).all()
-        return [DistrictOut(
-            id=d.id, code=d.code, name_ta=d.name_ta, name_en=d.name_en
-        ) for d in districts]
+        return [DistrictOut(id=d.id, code=d.code, name_ta=d.name_ta) for d in districts]
 
 
 @app.get("/blocks", response_model=list[BlockOut])
@@ -142,7 +138,7 @@ def list_blocks(district_code: str = Query(..., description="District code")):
 def get_fertilizer_stock(
     district_code: Optional[str] = Query(None),
     block_code: Optional[str] = Query(None),
-    fertilizer_code: Optional[str] = Query(None),
+    fertilizer_name: Optional[str] = Query(None, description="Filter by fertilizer name (Tamil)"),
     scrape_date: Optional[date] = Query(None, description="Filter by date (YYYY-MM-DD)"),
     limit: int = Query(500, le=5000),
 ):
@@ -160,14 +156,11 @@ def get_fertilizer_stock(
                 Block.name_ta.label("block_name"),
                 District.code.label("district_code"),
                 District.name_ta.label("district_name"),
-                Fertilizer.code.label("fert_code"),
-                Fertilizer.name_ta.label("fert_name_ta"),
             )
             .join(Dealer, FertilizerStock.dealer_id == Dealer.id)
             .join(Block, Dealer.block_id == Block.id)
             .join(District, Block.district_id == District.id)
-            .join(Fertilizer, FertilizerStock.fertilizer_id == Fertilizer.id)
-            .order_by(FertilizerStock.scraped_at.desc())
+            .order_by(FertilizerStock.scrape_date.desc())
             .limit(limit)
         )
 
@@ -175,10 +168,10 @@ def get_fertilizer_stock(
             stmt = stmt.where(District.code == district_code)
         if block_code:
             stmt = stmt.where(Block.code == block_code)
-        if fertilizer_code:
-            stmt = stmt.where(Fertilizer.code == fertilizer_code)
+        if fertilizer_name:
+            stmt = stmt.where(FertilizerStock.fertilizer_name == fertilizer_name)
         if scrape_date:
-            stmt = stmt.where(func.date(FertilizerStock.scraped_at) == scrape_date)
+            stmt = stmt.where(FertilizerStock.scrape_date == scrape_date)
 
         rows = session.execute(stmt).all()
 
@@ -190,9 +183,10 @@ def get_fertilizer_stock(
                 block_name=row.block_name,
                 district_code=row.district_code,
                 district_name=row.district_name,
-                fertilizer_name=row.fert_name_ta or row.fert_code,
-                quantity_kg=row.FertilizerStock.quantity_kg,
-                scraped_at=row.FertilizerStock.scraped_at,
+                fertilizer_name=row.FertilizerStock.fertilizer_name,
+                quantity=row.FertilizerStock.quantity,
+                unit=row.FertilizerStock.unit,
+                scrape_date=row.FertilizerStock.scrape_date,
             )
             for row in rows
         ]
@@ -214,21 +208,19 @@ def get_dealer_details(
         block = session.get(Block, dealer.block_id)
         district = session.get(District, block.district_id) if block else None
 
-        stock_rows = session.execute(
-            select(FertilizerStock, Fertilizer)
-            .join(Fertilizer, FertilizerStock.fertilizer_id == Fertilizer.id)
+        stock_rows = session.scalars(
+            select(FertilizerStock)
             .where(FertilizerStock.dealer_id == dealer.id)
-            .order_by(FertilizerStock.scraped_at.desc())
+            .order_by(FertilizerStock.scrape_date.desc())
             .limit(history_limit)
         ).all()
 
         history = [
             StockItem(
-                fertilizer_code=row.Fertilizer.code,
-                fertilizer_name_ta=row.Fertilizer.name_ta,
-                fertilizer_name_en=row.Fertilizer.name_en,
-                quantity_kg=row.FertilizerStock.quantity_kg,
-                scraped_at=row.FertilizerStock.scraped_at,
+                fertilizer_name=row.fertilizer_name,
+                quantity=row.quantity,
+                unit=row.unit,
+                scrape_date=row.scrape_date,
             )
             for row in stock_rows
         ]
@@ -254,8 +246,8 @@ def get_summary(scrape_date: Optional[date] = Query(None)):
                 District.code.label("district_code"),
                 District.name_ta.label("district_name"),
                 func.count(func.distinct(Dealer.id)).label("total_dealers"),
-                func.coalesce(func.sum(FertilizerStock.quantity_kg), 0).label("total_stock_kg"),
-                func.max(FertilizerStock.scraped_at).label("last_scraped"),
+                func.coalesce(func.sum(FertilizerStock.quantity), 0).label("total_stock_kg"),
+                func.max(FertilizerStock.scrape_date).label("last_scraped"),
             )
             .join(Block, Block.district_id == District.id)
             .join(Dealer, Dealer.block_id == Block.id)
@@ -265,7 +257,7 @@ def get_summary(scrape_date: Optional[date] = Query(None)):
         )
 
         if scrape_date:
-            stmt = stmt.where(func.date(FertilizerStock.scraped_at) == scrape_date)
+            stmt = stmt.where(FertilizerStock.scrape_date == scrape_date)
 
         rows = session.execute(stmt).all()
 

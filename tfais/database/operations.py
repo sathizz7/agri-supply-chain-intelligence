@@ -9,17 +9,15 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from tfais.database.models import (
     Block,
     Dealer,
-    Fertilizer,
+    District,
     FertilizerStock,
     ScrapeCheckpoint,
-    ScrapeMetadata,
-    District,
+    ScrapeRun,
 )
 from tfais.parser.card_parser import DealerRecord
 
@@ -81,14 +79,26 @@ def upsert_dealer(
 ) -> Dealer:
     """
     Upsert dealer by (dealer_code, block_id) — the canonical dedup key.
+    Empty dealer_code is allowed (partial unique index handles it in DB).
     Never uses license number (not visible on result cards).
     """
-    dealer = session.scalar(
-        select(Dealer).where(
-            Dealer.dealer_code == dealer_code,
-            Dealer.block_id == block_id,
+    if dealer_code:
+        dealer = session.scalar(
+            select(Dealer).where(
+                Dealer.dealer_code == dealer_code,
+                Dealer.block_id == block_id,
+            )
         )
-    )
+    else:
+        # No code: match by name + block to avoid duplicates on re-scrape
+        dealer = session.scalar(
+            select(Dealer).where(
+                Dealer.dealer_code == "",
+                Dealer.name_ta == name_ta,
+                Dealer.block_id == block_id,
+            )
+        )
+
     if dealer is None:
         dealer = Dealer(
             dealer_code=dealer_code,
@@ -99,33 +109,12 @@ def upsert_dealer(
         )
         session.add(dealer)
         session.flush()
-        log.debug(f"Inserted dealer: {dealer_code} / {name_ta}")
+        log.debug(f"Inserted dealer: '{dealer_code}' / {name_ta}")
     else:
         dealer.name_ta = name_ta
         dealer.address = address
         dealer.contact = contact
     return dealer
-
-
-# ---------------------------------------------------------------------------
-# Fertilizer master
-# ---------------------------------------------------------------------------
-
-def upsert_fertilizer(session: Session, name_ta: str) -> Fertilizer:
-    """
-    Get or create a fertilizer record by Tamil name.
-    Code defaults to the Tamil name (normalized) until manual mapping is added.
-    """
-    # Use the Tamil name as code (lowercase + strip whitespace) for dedup
-    code = name_ta.strip().lower().replace(" ", "_")
-
-    fert = session.scalar(select(Fertilizer).where(Fertilizer.code == code))
-    if fert is None:
-        fert = Fertilizer(code=code, name_ta=name_ta)
-        session.add(fert)
-        session.flush()
-        log.debug(f"Inserted fertilizer: {code} / {name_ta}")
-    return fert
 
 
 # ---------------------------------------------------------------------------
@@ -136,26 +125,38 @@ def insert_stock_batch(
     session: Session,
     dealer_id: int,
     stocks: dict[str, float],
-    scraped_at: datetime,
+    scrape_date,
     scrape_run_id: Optional[int],
-    structure_sig: Optional[str],
 ) -> int:
     """
     Bulk-insert fertilizer stock records for one dealer.
+    Uses ON CONFLICT DO NOTHING logic via UNIQUE(dealer_id, fertilizer_name, scrape_date).
     Returns number of rows inserted.
     """
     inserted = 0
     for fert_name, quantity in stocks.items():
         if not fert_name:
             continue
-        fertilizer = upsert_fertilizer(session, fert_name)
+
+        # Check for existing row (handles re-runs on same day gracefully)
+        existing = session.scalar(
+            select(FertilizerStock).where(
+                FertilizerStock.dealer_id == dealer_id,
+                FertilizerStock.fertilizer_name == fert_name,
+                FertilizerStock.scrape_date == scrape_date,
+            )
+        )
+        if existing is not None:
+            existing.quantity = quantity  # update if re-scraping same day
+            continue
+
         record = FertilizerStock(
             dealer_id=dealer_id,
-            fertilizer_id=fertilizer.id,
-            quantity_kg=quantity,
-            scraped_at=scraped_at,
+            fertilizer_name=fert_name,
+            quantity=quantity,
+            unit="KG",
+            scrape_date=scrape_date,
             scrape_run_id=scrape_run_id,
-            structure_sig=structure_sig,
         )
         session.add(record)
         inserted += 1
@@ -174,34 +175,34 @@ def persist_dealer_record(
 ) -> int:
     """
     Persist a fully parsed DealerRecord to the database.
-    Handles upserts for district, block, dealer, fertilizers, and stock.
+    Handles upserts for district, block, dealer, and stock.
 
     Returns number of stock rows inserted.
     """
     district = upsert_district(session, record.district_code, record.district_name)
     block = upsert_block(session, record.block_code, record.block_name, district.id)
 
-    # Skip anonymous cards (no dealer code or name)
     if not record.dealer_name:
         log.debug("Skipping record with empty dealer name")
         return 0
 
     dealer = upsert_dealer(
         session,
-        dealer_code=record.dealer_code or f"ANON_{record.dealer_name[:20]}",
+        dealer_code=record.dealer_code or "",
         name_ta=record.dealer_name,
         address=record.address,
         contact=record.contact,
         block_id=block.id,
     )
 
+    scrape_date = record.scraped_at.date() if isinstance(record.scraped_at, datetime) else record.scraped_at
+
     count = insert_stock_batch(
         session,
         dealer_id=dealer.id,
         stocks=record.stocks,
-        scraped_at=record.scraped_at,
+        scrape_date=scrape_date,
         scrape_run_id=scrape_run_id,
-        structure_sig=record.structure_sig,
     )
     return count
 
@@ -210,18 +211,22 @@ def persist_dealer_record(
 # Scrape run metadata
 # ---------------------------------------------------------------------------
 
-def create_scrape_run(session: Session) -> ScrapeMetadata:
+def create_scrape_run(session: Session, trigger_type: str = "manual") -> ScrapeRun:
     """Create a new scrape run record and return it (with id)."""
-    run = ScrapeMetadata(status="running", started_at=datetime.now(tz=timezone.utc))
+    run = ScrapeRun(
+        status="running",
+        trigger_type=trigger_type,
+        started_at=datetime.now(tz=timezone.utc),
+    )
     session.add(run)
     session.flush()
-    log.info(f"Scrape run created: id={run.id}")
+    log.info(f"Scrape run created: id={run.id} trigger={trigger_type}")
     return run
 
 
 def complete_scrape_run(
     session: Session,
-    run: ScrapeMetadata,
+    run: ScrapeRun,
     dealers_scraped: int,
     errors_count: int,
     districts_total: int = 0,
@@ -236,7 +241,7 @@ def complete_scrape_run(
     run.blocks_total = blocks_total
 
 
-def fail_scrape_run(session: Session, run: ScrapeMetadata, notes: str = "") -> None:
+def fail_scrape_run(session: Session, run: ScrapeRun, notes: str = "") -> None:
     """Mark a scrape run as failed."""
     run.completed_at = datetime.now(tz=timezone.utc)
     run.status = "failed"
@@ -297,6 +302,7 @@ def mark_block_error(
     scrape_run_id: int,
     district_code: str,
     block_code: str,
+    error_message: str = "",
 ) -> None:
     """Record a failed block in the checkpoint table."""
     cp = session.scalar(
@@ -314,4 +320,5 @@ def mark_block_error(
         )
         session.add(cp)
     cp.status = "error"
+    cp.error_message = error_message
     cp.completed_at = datetime.now(tz=timezone.utc)

@@ -75,7 +75,7 @@ def fetch_stock(
         r.raise_for_status()
         df = pd.DataFrame(r.json())
         if not df.empty:
-            df["scraped_at"] = pd.to_datetime(df["scraped_at"])
+            df["scrape_date"] = pd.to_datetime(df["scrape_date"])
         return df
     except Exception:
         return pd.DataFrame()
@@ -148,7 +148,7 @@ if page == "District Overview":
         col2.metric("Total Dealers", int(summary_df["total_dealers"].sum()))
         col3.metric(
             "Total Stock (tonnes)",
-            f"{summary_df['total_stock_kg'].sum() / 1000:.1f}",
+            f"{summary_df['total_stock_kg'].sum() / 1000:.1f}",  # API returns total_stock_kg
         )
 
         st.divider()
@@ -176,12 +176,12 @@ elif page == "Stock Trends":
     if df.empty:
         st.info("No stock data found for the selected filters.")
     else:
-        df["date"] = df["scraped_at"].dt.date
+        df["date"] = pd.to_datetime(df["scrape_date"]).dt.date
         trend_df = (
-            df.groupby(["date", "fertilizer_name"])["quantity_kg"]
+            df.groupby(["date", "fertilizer_name"])["quantity"]
             .sum()
             .reset_index()
-            .pivot(index="date", columns="fertilizer_name", values="quantity_kg")
+            .pivot(index="date", columns="fertilizer_name", values="quantity")
             .fillna(0)
         )
         st.line_chart(trend_df)
@@ -201,7 +201,7 @@ elif page == "Fertilizer Comparison":
         st.info("No stock data found for the selected filters.")
     else:
         fert_totals = (
-            df.groupby("fertilizer_name")["quantity_kg"]
+            df.groupby("fertilizer_name")["quantity"]
             .sum()
             .sort_values(ascending=False)
         )
@@ -209,10 +209,10 @@ elif page == "Fertilizer Comparison":
 
         st.subheader("Top Dealers by Stock")
         dealer_totals = (
-            df.groupby(["dealer_name", "block_name", "district_name"])["quantity_kg"]
+            df.groupby(["dealer_name", "block_name", "district_name"])["quantity"]
             .sum()
             .reset_index()
-            .sort_values("quantity_kg", ascending=False)
+            .sort_values("quantity", ascending=False)
             .head(20)
         )
         st.dataframe(dealer_totals, use_container_width=True, hide_index=True)
@@ -244,7 +244,7 @@ elif page == "Dealer Search":
             if result.get("stock_history"):
                 st.subheader("Stock History")
                 hist_df = pd.DataFrame(result["stock_history"])
-                hist_df["scraped_at"] = pd.to_datetime(hist_df["scraped_at"])
+                hist_df["scrape_date"] = pd.to_datetime(hist_df["scrape_date"])
                 st.dataframe(hist_df, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -270,12 +270,12 @@ elif page == "Alerts":
     if df.empty:
         st.info("No stock data available.")
     else:
-        latest = df.sort_values("scraped_at").groupby(
+        latest = df.sort_values("scrape_date").groupby(
             ["dealer_code", "fertilizer_name"]
         ).last().reset_index()
 
-        alerts = latest[latest["quantity_kg"] < low_stock_threshold].copy()
-        alerts = alerts.sort_values("quantity_kg")
+        alerts = latest[latest["quantity"] < low_stock_threshold].copy()
+        alerts = alerts.sort_values("quantity")  # quantity in kg
 
         if alerts.empty:
             st.success(
@@ -287,14 +287,14 @@ elif page == "Alerts":
             st.dataframe(
                 alerts[[
                     "district_name", "block_name", "dealer_name",
-                    "fertilizer_name", "quantity_kg", "scraped_at"
+                    "fertilizer_name", "quantity", "scrape_date"
                 ]].rename(columns={
                     "district_name": "District",
                     "block_name": "Block",
                     "dealer_name": "Dealer",
                     "fertilizer_name": "Fertilizer",
-                    "quantity_kg": "Stock (kg)",
-                    "scraped_at": "Last Scraped",
+                    "quantity": "Stock (kg)",
+                    "scrape_date": "Last Scraped",
                 }),
                 use_container_width=True,
                 hide_index=True,

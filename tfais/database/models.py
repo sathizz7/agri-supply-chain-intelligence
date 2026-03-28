@@ -1,30 +1,36 @@
 """
 Phase 3: SQLAlchemy ORM Models
 
-Tables:
+Tables (6 — fertilizers master table dropped per MVP schema review):
   districts         — Tamil Nadu districts
   blocks            — Blocks/circles within districts
   dealers           — Fertilizer dealers
-  fertilizers       — Fertilizer master reference
-  fertilizer_stock  — Time-series stock snapshots
-  scrape_metadata   — Per-run summary stats
+  fertilizer_stock  — Time-series stock snapshots (fact table)
+  scrape_runs       — Per-run summary stats (renamed from scrape_metadata)
   scrape_checkpoints— Resume-on-failure checkpoint log
 
-Design ref: docs/revised_HLD.md (Phase 3 / Storage Layer)
+Key schema decisions (from docs/db_schema_critique.md):
+  - fertilizer_name stored directly on fertilizer_stock (no master table)
+  - dealers uses partial unique index (WHERE dealer_code != '') to handle empty codes
+  - scrape_date DATE separates logical date from created_at TIMESTAMP
+  - UNIQUE(dealer_id, fertilizer_name, scrape_date) prevents duplicate daily rows
+  - Composite index (scrape_date, dealer_id) for dashboard's primary query pattern
 """
 from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
-    func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -46,8 +52,7 @@ class District(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(20), nullable=False, unique=True, index=True)
-    name_ta = Column(String(200), nullable=False)          # Tamil name (as scraped)
-    name_en = Column(String(200), nullable=True)           # English name (optional)
+    name_ta = Column(String(200), nullable=False)   # Tamil name (as scraped)
     created_at = Column(DateTime(timezone=True), default=_now_utc)
 
     blocks = relationship("Block", back_populates="district", lazy="dynamic")
@@ -76,11 +81,19 @@ class Block(Base):
 class Dealer(Base):
     __tablename__ = "dealers"
     __table_args__ = (
-        UniqueConstraint("dealer_code", "block_id", name="uq_dealer_block"),
+        # Partial unique index: only enforce uniqueness when dealer_code is non-empty.
+        # Prevents constraint violations when a dealer card has no extractable code.
+        Index(
+            "idx_dealer_dedup",
+            "dealer_code",
+            "block_id",
+            unique=True,
+            postgresql_where=text("dealer_code != ''"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    dealer_code = Column(String(50), nullable=False, index=True)
+    dealer_code = Column(String(50), nullable=False, default="", index=True)
     name_ta = Column(String(300), nullable=False)
     address = Column(Text, nullable=True)
     contact = Column(String(20), nullable=True)
@@ -95,56 +108,49 @@ class Dealer(Base):
         return f"<Dealer code={self.dealer_code} name={self.name_ta}>"
 
 
-class Fertilizer(Base):
-    __tablename__ = "fertilizers"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    code = Column(String(100), nullable=False, unique=True, index=True)
-    name_ta = Column(String(200), nullable=True)    # Tamil name (as seen on site)
-    name_en = Column(String(200), nullable=True)    # English equivalent (manual mapping)
-    category = Column(String(100), nullable=True)   # Nitrogenous / Phosphatic / etc.
-    created_at = Column(DateTime(timezone=True), default=_now_utc)
-
-    stock_records = relationship("FertilizerStock", back_populates="fertilizer", lazy="dynamic")
-
-    def __repr__(self):
-        return f"<Fertilizer code={self.code}>"
-
-
 # ---------------------------------------------------------------------------
 # Fact table (time-series)
 # ---------------------------------------------------------------------------
 
 class FertilizerStock(Base):
     __tablename__ = "fertilizer_stock"
+    __table_args__ = (
+        # Prevents duplicate rows if the scraper runs twice on the same day
+        UniqueConstraint("dealer_id", "fertilizer_name", "scrape_date", name="uq_stock_dealer_fert_date"),
+        # Composite index: the dashboard's primary query pattern is (date + dealer)
+        Index("idx_stock_date_dealer", "scrape_date", "dealer_id"),
+        # Secondary index for filtering by fertilizer type across all dealers
+        Index("idx_stock_fertilizer_name", "fertilizer_name"),
+    )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    dealer_id = Column(Integer, ForeignKey("dealers.id"), nullable=False, index=True)
-    fertilizer_id = Column(Integer, ForeignKey("fertilizers.id"), nullable=False, index=True)
-    quantity_kg = Column(Float, nullable=False, default=0.0)
-    scraped_at = Column(DateTime(timezone=True), nullable=False, index=True)
-    scrape_run_id = Column(Integer, ForeignKey("scrape_metadata.id"), nullable=True, index=True)
-    structure_sig = Column(String(64), nullable=True)   # MD5 from card parser
+    dealer_id = Column(Integer, ForeignKey("dealers.id"), nullable=False)
+    fertilizer_name = Column(String(100), nullable=False)  # stored as-is from card headers (Tamil)
+    quantity = Column(Float, nullable=False, default=0.0)
+    unit = Column(String(10), nullable=False, default="KG")
+    scrape_date = Column(Date, nullable=False)              # logical date this data represents
+    created_at = Column(DateTime(timezone=True), default=_now_utc)  # when this row was written
+    scrape_run_id = Column(Integer, ForeignKey("scrape_runs.id"), nullable=True, index=True)
 
     dealer = relationship("Dealer", back_populates="stock_records")
-    fertilizer = relationship("Fertilizer", back_populates="stock_records")
-    scrape_run = relationship("ScrapeMetadata", back_populates="stock_records")
+    scrape_run = relationship("ScrapeRun", back_populates="stock_records")
 
     def __repr__(self):
-        return f"<Stock dealer={self.dealer_id} fert={self.fertilizer_id} qty={self.quantity_kg}>"
+        return f"<Stock dealer={self.dealer_id} fert={self.fertilizer_name} qty={self.quantity}{self.unit}>"
 
 
 # ---------------------------------------------------------------------------
 # Scrape run tracking
 # ---------------------------------------------------------------------------
 
-class ScrapeMetadata(Base):
-    __tablename__ = "scrape_metadata"
+class ScrapeRun(Base):
+    __tablename__ = "scrape_runs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     started_at = Column(DateTime(timezone=True), nullable=False, default=_now_utc)
     completed_at = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(20), nullable=False, default="running")  # running/completed/failed
+    status = Column(String(20), nullable=False, default="running")  # running/completed/failed/partial
+    trigger_type = Column(String(20), nullable=False, default="manual")  # manual/scheduled/resume
     districts_total = Column(Integer, nullable=True)
     blocks_total = Column(Integer, nullable=True)
     dealers_scraped = Column(Integer, nullable=True, default=0)
@@ -155,13 +161,14 @@ class ScrapeMetadata(Base):
     checkpoints = relationship("ScrapeCheckpoint", back_populates="scrape_run", lazy="dynamic")
 
     def __repr__(self):
-        return f"<ScrapeRun id={self.id} status={self.status}>"
+        return f"<ScrapeRun id={self.id} status={self.status} trigger={self.trigger_type}>"
 
 
 class ScrapeCheckpoint(Base):
     """
     Records completion status for each (district, block) pair per run.
-    Used to skip already-completed pairs on resume.
+    Uses string codes (not FK integer IDs) because checkpoints are written
+    before districts/blocks are guaranteed to be committed — avoids chicken-and-egg.
     """
     __tablename__ = "scrape_checkpoints"
     __table_args__ = (
@@ -169,17 +176,19 @@ class ScrapeCheckpoint(Base):
             "scrape_run_id", "district_code", "block_code",
             name="uq_checkpoint_run_dist_block",
         ),
+        Index("idx_checkpoint_run_status", "scrape_run_id", "status"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    scrape_run_id = Column(Integer, ForeignKey("scrape_metadata.id"), nullable=False, index=True)
+    scrape_run_id = Column(Integer, ForeignKey("scrape_runs.id"), nullable=False, index=True)
     district_code = Column(String(20), nullable=False)
     block_code = Column(String(20), nullable=False)
     status = Column(String(20), nullable=False, default="pending")  # pending/done/error
     dealers_found = Column(Integer, nullable=True, default=0)
+    error_message = Column(Text, nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
-    scrape_run = relationship("ScrapeMetadata", back_populates="checkpoints")
+    scrape_run = relationship("ScrapeRun", back_populates="checkpoints")
 
     def __repr__(self):
         return (
