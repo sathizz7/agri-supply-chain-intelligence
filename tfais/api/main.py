@@ -15,6 +15,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
@@ -30,6 +31,20 @@ app = FastAPI(
     title="TFAIS API",
     description="Tamil Nadu Fertilizer Availability Intelligence System",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+    ],
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 
