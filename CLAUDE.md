@@ -1,121 +1,249 @@
-    # TFAIS — Claude Code Guide
+# TFAIS — Claude Code Guide
 
 ## Project
 
-Tamil Nadu Fertilizer Availability Intelligence System.
-Scrapes fertilizer stock data from Tamil Nadu government portal → PostgreSQL → FastAPI → Streamlit dashboard.
+Tamil Nadu Fertilizer & Agricultural Intelligence System.
+Modular scraper pipeline: scrapes multiple data sections from TN government portals → PostgreSQL → FastAPI → Streamlit dashboard.
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     TFAIS PIPELINE                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   CLI (main.py)                                                     │
+│     │  --section fertilizer  --subsection price  --check-health     │
+│     │  --resume (reuse last incomplete run_id for checkpoint cont.) │
+│     ▼                                                               │
+│   Orchestrator                                                      │
+│     │  creates ScrapeRun, runs controller, validates results        │
+│     │                                                               │
+│     └── FertilizerController                                        │
+│           ├── StockPositionParser   ✅ (ng-init JSON, session-based)│
+│           ├── FertilizerPriceParser ✅ (JSON API, stateless)        │
+│           └── BiofertilizerParser   🔮 (future — REST/Playwright)   │
+│                                                                     │
+│   Utilities (core/)                                                 │
+│     ├── http_utils.py   — retry decorator, rate-limit, headers      │
+│     └── metadata.py     — "Last update date" parsing                │
+│                                                                     │
+│   Database (database/)                                              │
+│     ├── Alembic migrations                                          │
+│     ├── ORM models (normalized relational)                          │
+│     └── Operations (upsert helpers)                                 │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Design Principles
+
+- **No premature abstraction** — no registry, no ABCs. Extract patterns when a second section proves duplication
+- **Each parser owns its HTTP** — StockPosition keeps `requests.Session()`, Price uses stateless `requests.post()` with `retry_request()`
+- **No legacy parallel paths** — old `scraper/` and `parser/` directories are migrated and deleted
+- **Validation is mandatory** — every parser has fetch → parse → validate → persist
+- **`safe_parse_number` returns `None`** — callers decide whether unknown means 0 or NULL. No silent 0.0 for garbage.
+- **Bilingual** — English default (`/en/` URLs), Tamil preserved in `name_ta` columns
+- **Error isolation** — one parser failure never kills others
 
 ## Key Facts (from live site inspection)
 
-- Site URL: `http://115.243.209.84/people_app/fertilizer/stock/tm/20/2020`
+- Main dashboard: `https://www.tnagrisnet.tn.gov.in/people_app/dashboard/main/en`
+- Fertilizer index: `http://115.243.209.84/people_app/fertilizer/index/en/20/2020`
 - Site uses **POST-based form workflow** (NOT GET URL crawling)
-- Results page has **card-based layout** (per-dealer cards with embedded mini-tables)
-- Fertilizer column headers are in **Tamil**, dynamic per dealer
-- Requires `requests.Session()` for cookie/session persistence
-- AngularJS + jQuery frontend — may need Playwright fallback if `requests` fails
+- AngularJS + jQuery frontend — data often embedded via ng-init JSON
+- Requires `requests.Session()` for stock position (cookie persistence)
+- Price endpoint is stateless — no session needed
+- "Last update date" available on stock page (span.text-danger)
 
-## Endpoints (live site)
+## Sections & Endpoints
 
+### Section: Fertilizer
+
+| Subsection | Status | Method | URL | Response |
+|---|---|---|---|---|
+| Stock Position | ✅ Done | POST | `/Fertilizer/result/en` | HTML with ng-init JSON |
+| Price | ✅ Done | POST | `/fertilizer_price/fertDetails/{fert_id}` | JSON array |
+| Biofertilizer | 🔮 Future | REST API | `tnagrisnet.tn.gov.in/agri_api/uatt/fert/*` | JSON (Angular SPA) |
+
+**Stock Position endpoints:**
 | Purpose | Method | URL |
 |---------|--------|-----|
-| Entry page (session bootstrap + district list) | GET | `/people_app/fertilizer/stock/tm/20/2020` |
-| Get blocks for a district | POST | `/people_app/Fertilizer/getBlocks/{district_id}` |
-| Get dealer results for a (district, block) | POST | `/people_app/Fertilizer/result/tm` |
+| Entry page (session + districts) | GET | `/people_app/fertilizer/stock/en/20/2020` |
+| Get blocks for district | POST | `/people_app/Fertilizer/getBlocks/{district_id}` |
+| Get dealer results | POST | `/people_app/Fertilizer/result/en` |
+
+**Price endpoints:**
+| Purpose | Method | URL |
+|---------|--------|-----|
+| Entry page (product list) | GET | `/people_app/fertilizer_price/index/en/20/2020` |
+| Get prices for product | POST | `/people_app/fertilizer_price/fertDetails/{fert_id}` |
 
 ## Folder Structure
 
 ```
 d:\Mini-proj\dashboard\
-├── CLAUDE.md
-├── main.py                    # CLI entry point
+├── CLAUDE.md                          # This file — system design brain
+├── main.py                            # CLI entry point
 ├── requirements.txt
-├── .env                       # DB credentials (not committed)
-├── .env.example
+├── alembic.ini                        # Alembic configuration
+├── alembic/                           # Migration scripts
+│   ├── env.py
+│   └── versions/
+├── .env / .env.example
+│
 ├── tfais/
+│   ├── __init__.py
 │   ├── config/
 │   │   ├── __init__.py
-│   │   └── settings.py        # DB URL, base URLs, timeouts, rate limits
-│   ├── scraper/
+│   │   └── settings.py               # DB URL, section URLs, timeouts
+│   │
+│   ├── core/                          # Thin shared utilities only
 │   │   ├── __init__.py
-│   │   ├── session_manager.py # SessionManager class
-│   │   └── scraper.py         # FertilizerScraper class
-│   ├── parser/
+│   │   ├── http_utils.py             # retry decorator, rate_limit(), DEFAULT_HEADERS
+│   │   └── metadata.py              # MetadataExtractor (last-update-date)
+│   │
+│   ├── sections/                      # Section-wise scraper modules
 │   │   ├── __init__.py
-│   │   └── card_parser.py     # CardParser + DealerRecord dataclass
+│   │   └── fertilizer/
+│   │       ├── __init__.py
+│   │       ├── controller.py          # FertilizerController (runs parsers directly)
+│   │       └── parsers/
+│   │           ├── __init__.py
+│   │           ├── stock_position.py  # StockPositionParser (owns session, parsing, checkpoints)
+│   │           ├── fertilizer_price.py# FertilizerPriceParser (stateless POST)
+│   │           └── biofertilizer.py   # BiofertilizerParser (stub)
+│   │
 │   ├── database/
 │   │   ├── __init__.py
-│   │   ├── models.py          # SQLAlchemy ORM models
-│   │   ├── connection.py      # Engine + session factory
-│   │   └── operations.py      # Upsert helpers
-│   ├── pipeline/
-│   │   ├── __init__.py
-│   │   └── orchestrator.py    # End-to-end pipeline
-│   └── api/
+│   │   ├── connection.py
+│   │   ├── models.py                  # All ORM models
+│   │   └── operations.py             # Upsert helpers
+│   │
+│   └── pipeline/
 │       ├── __init__.py
-│       └── main.py            # FastAPI app
+│       └── orchestrator.py            # Orchestrator (section-aware)
+│
 ├── dashboard/
-│   └── app.py                 # Streamlit dashboard
+│   └── app.py                         # Streamlit dashboard
+├── docs/
+│   ├── modular_HLD.md                 # Authoritative architecture doc
+│   ├── subsection_parser_logic.md    # Parser specs per subsection
+│   └── (legacy docs archived)
 ├── tests/
-│   ├── test_scraper.py
-│   ├── test_parser.py
+│   ├── test_stock_position.py
+│   ├── test_fertilizer_price.py
 │   └── test_db.py
 └── logs/
     └── .gitkeep
 ```
 
-## Implementation Phases
+> **Note:** The legacy `scraper/` and `parser/` directories are deleted. All logic lives in `sections/fertilizer/parsers/`.
 
-| Phase | Module | Status |
-|-------|--------|--------|
-| 0 | `scraper/session_manager.py` — SessionManager | Pending |
-| 1 | `scraper/scraper.py` — FertilizerScraper | Pending |
-| 2 | `parser/card_parser.py` — CardParser + DealerRecord | Pending |
-| 3 | `database/` — models, connection, operations | Pending |
-| 4 | `pipeline/orchestrator.py` — Orchestrator | Pending |
-| 5 | `api/main.py` — FastAPI endpoints | Pending |
-| 6 | `dashboard/app.py` — Streamlit UI | Pending |
+## Database Schema
 
-## Critical Design Docs
-
-- [docs/revised_HLD.md](docs/revised_HLD.md) — **Authoritative architecture** (supersedes intial_LLD.md)
-- [docs/card_parser.md](docs/card_parser.md) — **Authoritative card parser spec**
-- [docs/lld_review.md](docs/lld_review.md) — 5 critical issues and their fixes
-
-## Database Schema (target)
+### Core Tables
 
 | Table | Key Columns |
 |-------|-------------|
 | `districts` | `id`, `code UNIQUE`, `name_ta`, `name_en` |
-| `blocks` | `id`, `code`, `name_ta`, `district_id FK`, `UNIQUE(code, district_id)` |
-| `dealers` | `id`, `dealer_code`, `name_ta`, `address`, `contact`, `block_id FK`, `UNIQUE(dealer_code, block_id)` |
-| `fertilizers` | `id`, `code UNIQUE`, `name_ta`, `name_en`, `category` |
-| `fertilizer_stock` | `id`, `dealer_id FK`, `fertilizer_id FK`, `quantity_kg`, `scraped_at`, `scrape_run_id` |
-| `scrape_metadata` | `id (run_id)`, `started_at`, `completed_at`, `status`, counts |
-| `scrape_checkpoints` | `id`, `run_id`, `district_code`, `block_code`, `status`, `completed_at` |
+| `blocks` | `id`, `code`, `name_ta`, `name_en`, `district_id FK`, `UNIQUE(code, district_id)` |
+| `dealers` | `id`, `dealer_code`, `name_ta`, `address`, `contact`, `block_id FK` |
+| `fertilizer_stock` | `id`, `dealer_id FK`, `fertilizer_name`, `quantity`, `unit`, `scrape_date`, `scrape_run_id` |
+| `fertilizer_prices` | `id`, `product_id`, `product_name`, `company`, `price_per_50kg`, `scrape_date`, `scrape_run_id` |
+| `biofertilizer_stock` | `id`, `district_code`, `district_name`, `product_name`, `quantity`, `unit`, `scrape_date`, `scrape_run_id` |
+| `scrape_runs` | `id`, `started_at`, `status`, `section_id`, `subsection_id`, `source_updated_at` |
+| `scrape_anomalies` | `id`, `scrape_run_id FK`, `parser_id`, `anomaly_type`, `detail`, `severity` |
+| `scrape_checkpoints` | `id`, `run_id`, `parser_id`, `work_unit_key`, `status` |
+| `section_metadata` | `id`, `section_id`, `subsection_id`, `source_updated_at`, `last_scraped_at` |
 
-## Rules (enforced in all phases)
+### Migration Strategy
 
-- **Always use `requests.Session()`** — never stateless `requests.get()`
-- **Per-district/block error isolation** — `try/except` + `continue`, never kill the whole run
-- **Dedup key**: `UNIQUE(dealer_code, block_id)` — NOT license number
-- **Parser triage first**: classify page as `HAS_RESULTS | EMPTY | ERROR` before parsing cards
-- **Row classification**: cell-majority numeric test (NOT character-level `isdigit()`)
-- **Rate limit**: 2s between requests (configurable via `settings.py`)
-- **Implement phases in order** — each phase verified before next begins
+- **Alembic** for all schema changes — never `create_all_tables()` in production
+- Additive migrations only
+- `alembic upgrade head` before each pipeline run
+
+## CLI Usage
+
+```bash
+# Full scrape (all sections)
+python main.py
+
+# Section-specific
+python main.py --section fertilizer
+python main.py --section fertilizer --subsection price
+
+# Resume crashed run (reuse last incomplete run_id, skip done checkpoints)
+python main.py --section fertilizer --resume
+
+# Health check (monitoring)
+python main.py --check-health
+
+# Utilities
+python main.py --list-districts
+python main.py --create-tables
+
+# Legacy compat
+python main.py --district 3317 3338
+```
+
+## Validation & Monitoring
+
+### Per-parser validation (fetch → parse → **validate** → persist)
+
+| Level | Check | Action |
+|---|---|---|
+| Page | District returns 0 dealers but had dealers before | Flag ERROR, not EMPTY |
+| Record | Price negative or >PRICE_SPIKE_MULTIPLIER × median | Log WARNING, persist, write to `scrape_anomalies` |
+| Record | `safe_parse_number` returns too many `None`s (>MAX_NULL_RATIO) | Flag data quality issue |
+| Run | Total count < COUNT_DROP_THRESHOLD of previous run | Mark `suspicious`, write to `scrape_anomalies` |
+
+### Health check (`--check-health`)
+
+Reports:
+- Last successful run per subsection
+- Days since last data update
+- Record count trend (this run vs last 3 runs)
+- Warnings for stale or anomalous data
+
+## Rules
+
+- **Each parser owns its HTTP** — no shared HttpClient class
+- **All HTTP calls use `retry_request()`** — no bare `requests.post()` without retry
+- **Per-parser error isolation** — one subsection failure never kills others
+- **Per-parser checkpoints** — each parser defines its own work unit key
+- **Validation thresholds are parser-level constants** — `COUNT_DROP_THRESHOLD`, `PRICE_SPIKE_MULTIPLIER`, `MAX_NULL_RATIO`. No magic numbers in methods.
+- **`safe_parse_number()` returns `None` for garbage** — caller decides: `or 0.0` for stock (zero is valid), keep `None` for price (unknown ≠ zero)
+- **Anomalies stored in `scrape_anomalies` table** — structured, queryable. Not a TEXT column.
+- **Dedup key for dealers**: `UNIQUE(dealer_code, block_id)`
+- **English as default language** — use `/en/` URLs
+- **Bilingual storage** — `name_ta` + `name_en` for geography entities
+- **Rate limit**: 2s (stock), 1s (price) — configurable via `settings.py`
+- **Alembic for migrations** — always
+- **Validation before persist** — always
+
+## Known Constraints
+
+- **Sequential execution only**: Both parsers iterate with `time.sleep()` between calls. Stock Position does ~570 requests at 2s each (~19 min). If parallelism is needed later, the "parser owns timing" pattern must be refactored into async-compatible design (`asyncio`/`aiohttp` or thread pool with shared rate limiter). Accepted trade-off: simplicity now, harder to parallelize later.
+
+## Critical Design Docs
+
+- [docs/modular_HLD.md](docs/modular_HLD.md) — **Authoritative architecture**
+- [docs/subsection_parser_logic.md](docs/subsection_parser_logic.md) — **Per-subsection parser specs**
 
 ## Verification Commands
 
 ```bash
-# Phase 0: Session bootstrap
-python -c "from tfais.scraper.session_manager import SessionManager; sm = SessionManager(); d = sm.bootstrap(); print(d[:3])"
+# Run all tests
+pytest tests/ -v
 
-# Phase 2: Parser smoke test
-python -c "from tfais.parser.card_parser import CardParser; cp = CardParser(); print('OK')"
+# Pipeline (specific subsection)
+python main.py --section fertilizer --subsection price
 
-# Phase 5: API server
-uvicorn tfais.api.main:app --reload
-# Then visit http://127.0.0.1:8000/docs
+# Health check
+python main.py --check-health
 
-# Phase 6: Dashboard
-streamlit run dashboard/app.py
+# Alembic migration
+alembic upgrade head
+alembic revision --autogenerate -m "description"
 ```

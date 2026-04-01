@@ -11,15 +11,21 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from sqlalchemy import func
+
 from tfais.database.models import (
     Block,
     Dealer,
     District,
+    FertilizerPrice,
     FertilizerStock,
+    ScrapeAnomaly,
     ScrapeCheckpoint,
     ScrapeRun,
+    SectionMetadata,
 )
-from tfais.parser.card_parser import DealerRecord
+
+from tfais.sections.fertilizer.parsers.stock_position import DealerRecord
 
 log = logging.getLogger(__name__)
 
@@ -28,14 +34,14 @@ log = logging.getLogger(__name__)
 # District
 # ---------------------------------------------------------------------------
 
-def upsert_district(session: Session, code: str, name_ta: str) -> District:
-    """Insert or update a district record. Returns the persisted District object."""
+def upsert_district(session: Session, code: str, name_en: str = "", name_ta: str = "") -> District:
+    """Insert or update a district record with bilingual names. Returns the persisted District object."""
     district = session.scalar(select(District).where(District.code == code))
     if district is None:
-        district = District(code=code, name_ta=name_ta)
+        district = District(code=code, name_en=name_en, name_ta=name_ta)
         session.add(district)
         session.flush()
-        log.debug(f"Inserted district: {code} / {name_ta}")
+        log.debug(f"Inserted district: {code} / EN:{name_en} TA:{name_ta}")
     else:
         district.name_ta = name_ta
     return district
@@ -48,19 +54,21 @@ def upsert_district(session: Session, code: str, name_ta: str) -> District:
 def upsert_block(
     session: Session,
     code: str,
-    name_ta: str,
-    district_id: int,
+    name_en: str = "",
+    name_ta: str = "",
+    district_id: int = None,
 ) -> Block:
-    """Insert or update a block record."""
+    """Insert or update a block record with bilingual names."""
     block = session.scalar(
         select(Block).where(Block.code == code, Block.district_id == district_id)
     )
     if block is None:
-        block = Block(code=code, name_ta=name_ta, district_id=district_id)
+        block = Block(code=code, name_en=name_en, name_ta=name_ta, district_id=district_id)
         session.add(block)
         session.flush()
-        log.debug(f"Inserted block: {code} / {name_ta}")
+        log.debug(f"Inserted block: {code} / EN:{name_en} TA:{name_ta}")
     else:
+        block.name_en = name_en
         block.name_ta = name_ta
     return block
 
@@ -72,6 +80,7 @@ def upsert_block(
 def upsert_dealer(
     session: Session,
     dealer_code: str,
+    name_en: str,
     name_ta: str,
     address: str,
     contact: str,
@@ -80,7 +89,7 @@ def upsert_dealer(
     """
     Upsert dealer by (dealer_code, block_id) — the canonical dedup key.
     Empty dealer_code is allowed (partial unique index handles it in DB).
-    Never uses license number (not visible on result cards).
+    name_en (English, from delar_name) is primary; name_ta (Tamil, from tamil_agency) is fallback.
     """
     if dealer_code:
         dealer = session.scalar(
@@ -90,11 +99,11 @@ def upsert_dealer(
             )
         )
     else:
-        # No code: match by name + block to avoid duplicates on re-scrape
+        # No code: match by name_en + block to avoid duplicates on re-scrape
         dealer = session.scalar(
             select(Dealer).where(
                 Dealer.dealer_code == "",
-                Dealer.name_ta == name_ta,
+                Dealer.name_en == name_en,
                 Dealer.block_id == block_id,
             )
         )
@@ -102,6 +111,7 @@ def upsert_dealer(
     if dealer is None:
         dealer = Dealer(
             dealer_code=dealer_code,
+            name_en=name_en,
             name_ta=name_ta,
             address=address,
             contact=contact,
@@ -175,21 +185,22 @@ def persist_dealer_record(
 ) -> int:
     """
     Persist a fully parsed DealerRecord to the database.
-    Handles upserts for district, block, dealer, and stock.
+    Handles upserts for district, block, dealer, and stock with bilingual data.
 
     Returns number of stock rows inserted.
     """
-    district = upsert_district(session, record.district_code, record.district_name)
-    block = upsert_block(session, record.block_code, record.block_name, district.id)
+    district = upsert_district(session, record.district_code, name_en=record.district_name_en, name_ta=record.district_name_ta)
+    block = upsert_block(session, record.block_code, name_en=record.block_name_en, name_ta=record.block_name_ta, district_id=district.id)
 
-    if not record.dealer_name:
+    if not record.dealer_name_en and not record.dealer_name_ta:
         log.debug("Skipping record with empty dealer name")
         return 0
 
     dealer = upsert_dealer(
         session,
         dealer_code=record.dealer_code or "",
-        name_ta=record.dealer_name,
+        name_en=record.dealer_name_en,
+        name_ta=record.dealer_name_ta,
         address=record.address,
         contact=record.contact,
         block_id=block.id,
@@ -249,76 +260,236 @@ def fail_scrape_run(session: Session, run: ScrapeRun, notes: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint helpers
+# Legacy checkpoint helpers (removed — use is_checkpoint_done / mark_checkpoint)
 # ---------------------------------------------------------------------------
 
-def is_block_done(
+
+# ---------------------------------------------------------------------------
+# Generic checkpoint helpers (parser_id + work_unit_key)
+# ---------------------------------------------------------------------------
+
+def is_checkpoint_done(
     session: Session,
-    scrape_run_id: int,
-    district_code: str,
-    block_code: str,
+    run_id: int,
+    parser_id: str,
+    work_unit_key: str,
 ) -> bool:
-    """Check if this (district, block) was already completed in this run."""
+    """Check if this work unit was already completed in this run."""
     cp = session.scalar(
         select(ScrapeCheckpoint).where(
-            ScrapeCheckpoint.scrape_run_id == scrape_run_id,
-            ScrapeCheckpoint.district_code == district_code,
-            ScrapeCheckpoint.block_code == block_code,
+            ScrapeCheckpoint.scrape_run_id == run_id,
+            ScrapeCheckpoint.parser_id == parser_id,
+            ScrapeCheckpoint.work_unit_key == work_unit_key,
             ScrapeCheckpoint.status == "done",
         )
     )
     return cp is not None
 
 
-def mark_block_done(
+def mark_checkpoint(
     session: Session,
-    scrape_run_id: int,
-    district_code: str,
-    block_code: str,
-    dealers_found: int = 0,
-) -> None:
-    """Record a successfully scraped block in the checkpoint table."""
-    cp = session.scalar(
-        select(ScrapeCheckpoint).where(
-            ScrapeCheckpoint.scrape_run_id == scrape_run_id,
-            ScrapeCheckpoint.district_code == district_code,
-            ScrapeCheckpoint.block_code == block_code,
-        )
-    )
-    if cp is None:
-        cp = ScrapeCheckpoint(
-            scrape_run_id=scrape_run_id,
-            district_code=district_code,
-            block_code=block_code,
-        )
-        session.add(cp)
-    cp.status = "done"
-    cp.dealers_found = dealers_found
-    cp.completed_at = datetime.now(tz=timezone.utc)
-
-
-def mark_block_error(
-    session: Session,
-    scrape_run_id: int,
-    district_code: str,
-    block_code: str,
+    run_id: int,
+    parser_id: str,
+    work_unit_key: str,
+    status: str = "done",
+    records_found: int = 0,
     error_message: str = "",
 ) -> None:
-    """Record a failed block in the checkpoint table."""
+    """Record a checkpoint for a generic work unit."""
     cp = session.scalar(
         select(ScrapeCheckpoint).where(
-            ScrapeCheckpoint.scrape_run_id == scrape_run_id,
-            ScrapeCheckpoint.district_code == district_code,
-            ScrapeCheckpoint.block_code == block_code,
+            ScrapeCheckpoint.scrape_run_id == run_id,
+            ScrapeCheckpoint.parser_id == parser_id,
+            ScrapeCheckpoint.work_unit_key == work_unit_key,
         )
     )
     if cp is None:
         cp = ScrapeCheckpoint(
-            scrape_run_id=scrape_run_id,
-            district_code=district_code,
-            block_code=block_code,
+            scrape_run_id=run_id,
+            parser_id=parser_id,
+            work_unit_key=work_unit_key,
         )
         session.add(cp)
-    cp.status = "error"
+    cp.status = status
+    cp.dealers_found = records_found
     cp.error_message = error_message
     cp.completed_at = datetime.now(tz=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def get_previous_count(session: Session, parser_id: str) -> int:
+    """Get the total record count from the most recent completed run for this parser."""
+    last_run = session.scalar(
+        select(ScrapeRun)
+        .where(
+            ScrapeRun.subsection_id == parser_id,
+            ScrapeRun.status == "completed",
+        )
+        .order_by(ScrapeRun.completed_at.desc())
+        .limit(1)
+    )
+    if not last_run:
+        return 0
+
+    # Count checkpoints that recorded records_found
+    total = session.scalar(
+        select(func.sum(ScrapeCheckpoint.dealers_found))
+        .where(
+            ScrapeCheckpoint.scrape_run_id == last_run.id,
+            ScrapeCheckpoint.parser_id == parser_id,
+            ScrapeCheckpoint.status == "done",
+        )
+    )
+    return total or 0
+
+
+def get_previous_product_ids(session: Session) -> set[int]:
+    """Get all product IDs from the most recent price scrape."""
+    result = session.scalars(
+        select(FertilizerPrice.product_id).distinct()
+    ).all()
+    return set(result)
+
+
+# ---------------------------------------------------------------------------
+# Anomaly persistence
+# ---------------------------------------------------------------------------
+
+def insert_anomaly_batch(
+    session: Session,
+    run_id: int,
+    anomalies: list[dict],
+) -> int:
+    """Insert validation anomalies for a run. Returns count inserted."""
+    inserted = 0
+    for a in anomalies:
+        session.add(ScrapeAnomaly(
+            scrape_run_id=run_id,
+            parser_id=a.get("parser_id", "unknown"),
+            anomaly_type=a.get("anomaly_type", "unknown"),
+            detail=a.get("detail", ""),
+            severity=a.get("severity", "warning"),
+        ))
+        inserted += 1
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Section metadata
+# ---------------------------------------------------------------------------
+
+def upsert_section_metadata(
+    session: Session,
+    section_id: str,
+    subsection_id: str,
+    source_updated_at: Optional[datetime] = None,
+) -> SectionMetadata:
+    """Upsert the metadata record for a section/subsection."""
+    meta = session.scalar(
+        select(SectionMetadata).where(
+            SectionMetadata.section_id == section_id,
+            SectionMetadata.subsection_id == subsection_id,
+        )
+    )
+    if meta is None:
+        meta = SectionMetadata(section_id=section_id, subsection_id=subsection_id)
+        session.add(meta)
+
+    meta.last_scraped_at = datetime.now(tz=timezone.utc)
+    if source_updated_at:
+        meta.source_updated_at = source_updated_at
+    session.flush()
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Price persistence
+# ---------------------------------------------------------------------------
+
+def insert_price_batch(
+    session: Session,
+    records: list,
+    run_id: int,
+) -> int:
+    """
+    Insert/update fertilizer price records.
+    Upserts on (product_id, company, scrape_date).
+    Returns count of new rows inserted.
+    """
+    inserted = 0
+    for r in records:
+        scrape_date = r.scraped_at.date() if isinstance(r.scraped_at, datetime) else r.scraped_at
+        existing = session.scalar(
+            select(FertilizerPrice).where(
+                FertilizerPrice.product_id == r.product_id,
+                FertilizerPrice.company == r.company,
+                FertilizerPrice.scrape_date == scrape_date,
+            )
+        )
+        if existing:
+            existing.price_per_50kg = r.price_per_50kg
+        else:
+            session.add(FertilizerPrice(
+                product_id=r.product_id,
+                product_name=r.product_name,
+                company=r.company,
+                price_per_50kg=r.price_per_50kg,
+                scrape_date=scrape_date,
+                scrape_run_id=run_id,
+            ))
+            inserted += 1
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Health check queries
+# ---------------------------------------------------------------------------
+
+def get_health_report(session: Session) -> list[dict]:
+    """
+    Build a health report for all known subsections.
+    Returns list of dicts with last run info and record counts.
+    """
+    report = []
+    metadata_rows = session.scalars(select(SectionMetadata)).all()
+
+    for meta in metadata_rows:
+        last_run = session.scalar(
+            select(ScrapeRun)
+            .where(
+                ScrapeRun.section_id == meta.section_id,
+                ScrapeRun.subsection_id == meta.subsection_id,
+                ScrapeRun.status == "completed",
+            )
+            .order_by(ScrapeRun.completed_at.desc())
+            .limit(1)
+        )
+
+        recent_anomalies = session.scalars(
+            select(ScrapeAnomaly)
+            .where(ScrapeAnomaly.parser_id == meta.subsection_id)
+            .order_by(ScrapeAnomaly.created_at.desc())
+            .limit(5)
+        ).all()
+
+        report.append({
+            "section_id": meta.section_id,
+            "subsection_id": meta.subsection_id,
+            "last_scraped_at": meta.last_scraped_at,
+            "source_updated_at": meta.source_updated_at,
+            "last_run": {
+                "id": last_run.id if last_run else None,
+                "status": last_run.status if last_run else None,
+                "completed_at": last_run.completed_at if last_run else None,
+                "dealers_scraped": last_run.dealers_scraped if last_run else None,
+            },
+            "recent_anomalies": [
+                {"type": a.anomaly_type, "detail": a.detail, "severity": a.severity}
+                for a in recent_anomalies
+            ],
+        })
+
+    return report

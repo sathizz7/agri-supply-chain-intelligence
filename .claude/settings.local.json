@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /d/Mini-proj/dashboard -type f \\\\\\(-name *.json -o -name *.py -o -name *.sql -o -name *.csv \\\\\\))",
+      "Bash(grep -r code.*name_ta /d/Mini-proj/dashboard/docs)",
+      "Bash(head -c 10000 \"/d/Mini-proj/dashboard/data/TAMIL NADU_DISTRICTS \\(2\\).geojson\")",
+      "Bash(head -c 50000 \"/d/Mini-proj/dashboard/data/TAMIL NADU_DISTRICTS \\(2\\).geojson\")",
+      "Bash(find /d/Mini-proj/dashboard/docs -type f -name *.md)",
+      "Bash(grep -l \"district\\\\|अरि\\\\|அரி\" /d/Mini-proj/dashboard/docs/*.md)"
+    ]
+  }
+}

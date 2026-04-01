@@ -1,173 +1,184 @@
 """
-Phase 4: Pipeline Orchestrator
+Pipeline Orchestrator — Section-aware.
 
-Ties together: SessionManager → FertilizerScraper → CardParser → Database.
-Supports checkpointing (skip already-done blocks on resume).
+Routes CLI commands to the appropriate section controller.
+Supports: --section, --subsection, --check-health, and legacy --district mode.
 
-Design ref: docs/revised_HLD.md (Phase 4)
+Design ref: docs/modular_HLD.md (Layer 2)
 """
 import logging
-import time
+from datetime import datetime, timezone
 
-from tfais.config.settings import RATE_LIMIT_SECONDS
-from tfais.database.connection import create_all_tables, get_session
+from tfais.database.connection import get_session
 from tfais.database.operations import (
     complete_scrape_run,
     create_scrape_run,
     fail_scrape_run,
-    is_block_done,
-    mark_block_done,
-    mark_block_error,
-    persist_dealer_record,
+    get_health_report,
 )
-from tfais.parser.card_parser import CardParser
-from tfais.scraper.scraper import FertilizerScraper
-from tfais.scraper.session_manager import SessionManager
 
 log = logging.getLogger(__name__)
 
 
 class Orchestrator:
     """
-    End-to-end TFAIS scrape pipeline.
+    End-to-end TFAIS pipeline orchestrator.
 
     Usage:
         orch = Orchestrator()
-        orch.run()                           # full run
-        orch.run(district_filter=["1","2"])  # limited run for testing
+        orch.run(section="fertilizer", subsection="price")
+        orch.run(section="fertilizer", district_filter=["3317"])
+        orch.check_health()
     """
 
-    def __init__(self, rate_limit: float = RATE_LIMIT_SECONDS):
-        self.rate_limit = rate_limit
-        self.parser = CardParser()
+    # Known sections → controller classes (lazy imports to avoid circular deps)
+    SECTIONS = {
+        "fertilizer": "tfais.sections.fertilizer.controller.FertilizerController",
+    }
 
-    def run(self, district_filter: list[str] | None = None) -> dict:
+    def run(
+        self,
+        section: str | None = None,
+        subsection: str | None = None,
+        district_filter: list[str] | None = None,
+    ) -> dict:
         """
-        Execute the full scrape pipeline.
+        Execute the pipeline for a section/subsection.
 
         Args:
-            district_filter: Limit to specific district codes (for testing).
+            section: Section name (default: "fertilizer")
+            subsection: Subsection filter (e.g. "stock", "price")
+            district_filter: Limit to specific district codes
 
         Returns:
             Summary dict with run stats.
         """
-        log.info("=== TFAIS Scrape Pipeline Starting ===")
+        section = section or "fertilizer"
+        log.info(f"=== TFAIS Pipeline Starting: section={section} subsection={subsection} ===")
 
-        # Ensure DB schema exists
-        create_all_tables()
-
-        session_manager = SessionManager()
-        scraper = FertilizerScraper(session_manager, rate_limit=self.rate_limit)
-
-        # Bootstrap: get district list
-        try:
-            districts = session_manager.bootstrap()
-        except Exception as exc:
-            log.critical(f"Bootstrap failed — cannot proceed: {exc}")
-            return {"status": "failed", "error": str(exc)}
-
-        if district_filter:
-            districts = [d for d in districts if d["code"] in district_filter]
-
-        total_districts = len(districts)
-        log.info(f"Districts to scrape: {total_districts}")
+        if section not in self.SECTIONS:
+            log.error(f"Unknown section: {section}. Available: {list(self.SECTIONS.keys())}")
+            return {"status": "error", "error": f"Unknown section: {section}"}
 
         # Create scrape run record
         with get_session() as session:
-            run = create_scrape_run(session)
+            run = create_scrape_run(session, trigger_type="manual")
+            run.section_id = section
+            run.subsection_id = subsection
             run_id = run.id
 
-        dealers_scraped = 0
-        errors_count = 0
-        blocks_total = 0
+        try:
+            # Get controller
+            controller = self._get_controller(section)
 
-        for district in districts:
-            try:
-                blocks = session_manager.get_blocks_for_district(district["code"])
-            except Exception as exc:
-                log.error(
-                    f"Failed to get blocks for district {district.get('name_ta', district['code'])}: {exc}"
-                )
-                errors_count += 1
-                continue
+            # Build subsection filter
+            subsection_filter = [subsection] if subsection else None
 
-            blocks_total += len(blocks)
-            log.info(
-                f"District {district.get('name_ta', district['code'])} "
-                f"({district['code']}): {len(blocks)} blocks"
+            # Run the section controller
+            results = controller.run(
+                db_session_factory=get_session,
+                run_id=run_id,
+                subsection_filter=subsection_filter,
+                district_filter=district_filter,
             )
 
-            for block in blocks:
-                # Check checkpoint — skip if already done in this run
-                with get_session() as session:
-                    if is_block_done(session, run_id, district["code"], block["code"]):
-                        log.debug(
-                            f"  Skipping already-done: "
-                            f"dist={district['code']} block={block['code']}"
-                        )
-                        continue
+            # Finalize run
+            total_records = sum(
+                r.get("records", 0) for r in results.values()
+                if isinstance(r, dict) and "records" in r
+            )
+            total_errors = sum(
+                1 for r in results.values()
+                if isinstance(r, dict) and r.get("status") == "error"
+            )
 
-                try:
-                    # Fetch raw HTML
-                    html = session_manager.fetch_results(district["code"], block["code"])
-                    time.sleep(self.rate_limit)
-
-                    # Parse cards
-                    records = self.parser.parse(html, district, block)
-                    log.info(
-                        f"  Block {block.get('name_ta', block['code'])}: "
-                        f"{len(records)} dealers"
+            with get_session() as session:
+                from tfais.database.models import ScrapeRun
+                run_obj = session.get(ScrapeRun, run_id)
+                if run_obj:
+                    complete_scrape_run(
+                        session, run_obj,
+                        dealers_scraped=total_records,
+                        errors_count=total_errors,
                     )
 
-                    # Persist to DB
-                    block_dealer_count = 0
-                    with get_session() as session:
-                        for record in records:
-                            try:
-                                count = persist_dealer_record(session, record, run_id)
-                                dealers_scraped += count > 0
-                                block_dealer_count += 1
-                            except Exception as exc:
-                                log.error(
-                                    f"    DB write failed for dealer "
-                                    f"{record.dealer_code}: {exc}"
-                                )
+            summary = {
+                "status": "completed",
+                "run_id": run_id,
+                "section": section,
+                "subsection": subsection,
+                "results": results,
+                "total_records": total_records,
+                "total_errors": total_errors,
+            }
+            log.info(f"=== Pipeline complete: {summary} ===")
+            return summary
 
-                        mark_block_done(
-                            session, run_id, district["code"], block["code"],
-                            dealers_found=block_dealer_count,
-                        )
+        except Exception as exc:
+            log.critical(f"Pipeline failed: {exc}", exc_info=True)
+            with get_session() as session:
+                from tfais.database.models import ScrapeRun
+                run_obj = session.get(ScrapeRun, run_id)
+                if run_obj:
+                    fail_scrape_run(session, run_obj, notes=str(exc))
+            return {"status": "failed", "run_id": run_id, "error": str(exc)}
 
-                except Exception as exc:
-                    log.error(
-                        f"  FAILED block {block.get('name_ta', block['code'])} "
-                        f"({block['code']}) in {district.get('name_ta', district['code'])}: {exc}"
-                    )
-                    errors_count += 1
-                    with get_session() as session:
-                        mark_block_error(session, run_id, district["code"], block["code"])
+    def check_health(self) -> None:
+        """
+        Print a health report for all known subsections.
+        Queries section_metadata, scrape_anomalies, and last run stats.
+        """
+        from datetime import timezone
 
-        # Finalize run record
+        print()
+        print(f"TFAIS Health Report — {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print("=" * 50)
+
         with get_session() as session:
-            from tfais.database.models import ScrapeRun
-            run_obj = session.get(ScrapeRun, run_id)
-            if run_obj:
-                complete_scrape_run(
-                    session,
-                    run_obj,
-                    dealers_scraped=dealers_scraped,
-                    errors_count=errors_count,
-                    districts_total=total_districts,
-                    blocks_total=blocks_total,
-                )
+            report = get_health_report(session)
 
-        summary = {
-            "status": "completed",
-            "run_id": run_id,
-            "districts": total_districts,
-            "blocks": blocks_total,
-            "dealers_scraped": dealers_scraped,
-            "errors": errors_count,
-        }
-        log.info(f"=== Pipeline complete: {summary} ===")
-        return summary
+        if not report:
+            print("\nNo scrape data found. Run the pipeline first.")
+            print()
+            return
+
+        for item in report:
+            section_key = f"{item['section_id']}.{item['subsection_id']}"
+            print(f"\n{section_key}")
+
+            last_run = item.get("last_run", {})
+            if last_run.get("id"):
+                completed = last_run.get("completed_at")
+                if completed:
+                    age = datetime.now(tz=timezone.utc) - completed
+                    age_str = f"{age.total_seconds() / 3600:.0f}h ago"
+                else:
+                    age_str = "in progress"
+                print(f"  Last run:     {age_str} (run #{last_run['id']}, {last_run['status']})")
+                if last_run.get("dealers_scraped") is not None:
+                    print(f"  Records:      {last_run['dealers_scraped']}")
+            else:
+                print("  Last run:     never")
+
+            source_date = item.get("source_updated_at")
+            if source_date:
+                print(f"  Source date:  {source_date.strftime('%d-%m-%Y')}")
+
+            anomalies = item.get("recent_anomalies", [])
+            if anomalies:
+                print(f"  Anomalies:    {len(anomalies)} recent")
+                for a in anomalies[:3]:
+                    print(f"    [{a['severity']}] {a['type']}: {a['detail']}")
+            else:
+                print("  Anomalies:    None")
+
+        print()
+
+    def _get_controller(self, section: str):
+        """Lazy-import and instantiate a section controller."""
+        import importlib
+
+        module_path, class_name = self.SECTIONS[section].rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        ControllerClass = getattr(module, class_name)
+        return ControllerClass()

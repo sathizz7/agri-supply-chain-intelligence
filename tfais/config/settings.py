@@ -9,9 +9,14 @@ load_dotenv()
 
 # --- Target site ---
 BASE_URL = "http://115.243.209.84/people_app"
-ENTRY_URL = f"{BASE_URL}/fertilizer/stock/tm/20/2020"
+ENTRY_URL = f"{BASE_URL}/fertilizer/stock/en/20/2020"
 BLOCKS_URL = f"{BASE_URL}/Fertilizer/getBlocks"    # POST /{district_id}
-RESULTS_URL = f"{BASE_URL}/Fertilizer/result/tm"   # POST with form data
+RESULTS_URL = f"{BASE_URL}/Fertilizer/result/en"   # POST with form data
+
+# --- Fertilizer Price endpoints ---
+PRICE_ENTRY_URL = f"{BASE_URL}/fertilizer_price/index/en/20/2020"
+PRICE_API_URL = f"{BASE_URL}/fertilizer_price/fertDetails"
+PRICE_RATE_LIMIT = float(os.getenv("PRICE_RATE_LIMIT_SECONDS", 1.0))
 
 # --- HTTP behaviour ---
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))

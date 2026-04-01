@@ -2,9 +2,13 @@
 TFAIS — CLI entry point
 
 Usage:
-    python main.py                          # full scrape
-    python main.py --district 1 2 3         # scrape specific districts only
-    python main.py --create-tables          # create DB schema (no scrape)
+    python main.py                                          # full scrape (all fertilizer subsections)
+    python main.py --section fertilizer --subsection stock  # stock position only
+    python main.py --section fertilizer --subsection price  # price only
+    python main.py --district 3317 3338                     # stock position, specific districts
+    python main.py --check-health                           # health report
+    python main.py --create-tables                          # create DB schema (no scrape)
+    python main.py --list-districts                         # print district codes
 
 Logging is written to both stdout and logs/tfais.log.
 """
@@ -36,14 +40,30 @@ def main():
 
     parser = argparse.ArgumentParser(description="TFAIS Scraper Pipeline")
     parser.add_argument(
+        "--section",
+        choices=["fertilizer"],
+        default=None,
+        help="Section to scrape (default: fertilizer)",
+    )
+    parser.add_argument(
+        "--subsection",
+        choices=["stock", "price", "biofertilizer"],
+        default=None,
+        help="Subsection to scrape within the section",
+    )
+    parser.add_argument(
         "--district",
         nargs="+",
         metavar="CODE",
         help=(
-            "Limit scrape to specific district codes. "
-            "Use --list-districts first to see the real 4-digit codes "
-            "(e.g. --district 3317 3338)"
+            "Limit stock scrape to specific district codes. "
+            "Use --list-districts to see codes (e.g. --district 3317 3338)"
         ),
+    )
+    parser.add_argument(
+        "--check-health",
+        action="store_true",
+        help="Print health report for all subsections and exit",
     )
     parser.add_argument(
         "--create-tables",
@@ -57,13 +77,18 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.check_health:
+        from tfais.pipeline.orchestrator import Orchestrator
+        orch = Orchestrator()
+        orch.check_health()
+        return
+
     if args.list_districts:
-        import io, sys
-        # Force UTF-8 for Tamil text on Windows terminals
+        import io
         out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        from tfais.scraper.session_manager import SessionManager
-        sm = SessionManager()
-        districts = sm.bootstrap()
+        from tfais.sections.fertilizer.parsers.stock_position import StockPositionParser
+        sp = StockPositionParser()
+        districts = sp.bootstrap()
         out.write(f"\nAvailable districts ({len(districts)} total):\n\n")
         for d in districts:
             out.write(f"  {d['code']:>6}  {d['name_ta']}\n")
@@ -81,11 +106,31 @@ def main():
     from tfais.pipeline.orchestrator import Orchestrator
 
     orch = Orchestrator()
-    result = orch.run(district_filter=args.district)
+
+    # If --district is given without --subsection, default to stock
+    subsection = args.subsection
+    if args.district and not subsection:
+        subsection = "stock"
+
+    result = orch.run(
+        section=args.section,
+        subsection=subsection,
+        district_filter=args.district,
+    )
 
     print("\n=== Run Summary ===")
     for k, v in result.items():
-        print(f"  {k}: {v}")
+        if k == "results" and isinstance(v, dict):
+            for parser_name, parser_result in v.items():
+                print(f"  {parser_name}:")
+                if isinstance(parser_result, dict):
+                    for pk, pv in parser_result.items():
+                        if pk != "anomalies":
+                            print(f"    {pk}: {pv}")
+                        elif pv:
+                            print(f"    anomalies: {len(pv)}")
+        else:
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
