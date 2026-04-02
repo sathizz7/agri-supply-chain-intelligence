@@ -14,15 +14,21 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from tfais.database.models import (
+    AgriSeed,
     Block,
     Dealer,
     District,
+    DroneOwner,
     FertilizerPrice,
     FertilizerStock,
+    HortiSeed,
     ScrapeAnomaly,
     ScrapeCheckpoint,
     ScrapeRun,
     SectionMetadata,
+    SeasonSeed,
+    TractorOwner,
+    WomenPLF,
 )
 
 from tfais.sections.fertilizer.parsers.stock_position import DealerRecord
@@ -441,6 +447,358 @@ def insert_price_batch(
                 scrape_run_id=run_id,
             ))
             inserted += 1
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Seed stock persistence — one function per subsection table
+# ---------------------------------------------------------------------------
+
+def insert_agri_seed_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Upserts agri seed records into seed.agri_seeds.
+    Unique key: (block_code, crop_name, crop_variety, agency_name, scrape_date).
+    """
+    inserted = 0
+    seen = set()
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if hasattr(r, "scraped_at") else r.scrape_date
+            key = (r.block_code, r.crop_name, r.crop_variety, r.agency_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(AgriSeed).where(
+                    AgriSeed.block_code == r.block_code,
+                    AgriSeed.crop_name == r.crop_name,
+                    AgriSeed.crop_variety == r.crop_variety,
+                    AgriSeed.agency_name == r.agency_name,
+                    AgriSeed.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.seed_class = r.seed_class
+                existing.contact_person = r.contact_person
+                existing.contact_phone = r.contact_phone
+                existing.quantity_available = r.quantity_available
+                existing.unit = r.unit
+                existing.price = r.price
+            else:
+                session.add(AgriSeed(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    crop_name=r.crop_name,
+                    crop_variety=r.crop_variety,
+                    seed_class=r.seed_class,
+                    agency_name=r.agency_name,
+                    contact_person=r.contact_person,
+                    contact_phone=r.contact_phone,
+                    quantity_available=r.quantity_available,
+                    unit=r.unit,
+                    price=r.price,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
+    return inserted
+
+
+def insert_horti_seed_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Upserts horti seed records into seed.horti_seeds.
+    Unique key: (block_code, stock_type, input_name, agency_name, scrape_date).
+    """
+    inserted = 0
+    seen = set()
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if hasattr(r, "scraped_at") else r.scrape_date
+            key = (r.block_code, r.stock_type, r.input_name, r.agency_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(HortiSeed).where(
+                    HortiSeed.block_code == r.block_code,
+                    HortiSeed.stock_type == r.stock_type,
+                    HortiSeed.input_name == r.input_name,
+                    HortiSeed.agency_name == r.agency_name,
+                    HortiSeed.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.seed_class = r.seed_class
+                existing.crop_variety = r.crop_variety
+                existing.contact_person = r.contact_person
+                existing.contact_phone = r.contact_phone
+                existing.quantity_available = r.quantity_available
+                existing.unit = r.unit
+                existing.price = r.price
+            else:
+                session.add(HortiSeed(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    stock_type=r.stock_type,
+                    input_name=r.input_name,
+                    seed_class=r.seed_class,
+                    crop_variety=r.crop_variety,
+                    agency_name=r.agency_name,
+                    contact_person=r.contact_person,
+                    contact_phone=r.contact_phone,
+                    quantity_available=r.quantity_available,
+                    unit=r.unit,
+                    price=r.price,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
+    return inserted
+
+
+def insert_season_seed_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Upserts season seed records into seed.season_seeds.
+    Unique key: (block_code, season, crop_name, crop_variety, agency_name, scrape_date).
+    """
+    inserted = 0
+    seen = set()
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if hasattr(r, "scraped_at") else r.scrape_date
+            key = (r.block_code, r.season, r.crop_name, r.crop_variety, r.agency_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(SeasonSeed).where(
+                    SeasonSeed.block_code == r.block_code,
+                    SeasonSeed.season == r.season,
+                    SeasonSeed.crop_name == r.crop_name,
+                    SeasonSeed.crop_variety == r.crop_variety,
+                    SeasonSeed.agency_name == r.agency_name,
+                    SeasonSeed.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.seed_class = r.seed_class
+                existing.contact_person = r.contact_person
+                existing.contact_phone = r.contact_phone
+                existing.quantity_available = r.quantity_available
+                existing.unit = r.unit
+                existing.price = r.price
+            else:
+                session.add(SeasonSeed(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    season=r.season,
+                    crop_name=r.crop_name,
+                    crop_variety=r.crop_variety,
+                    seed_class=r.seed_class,
+                    agency_name=r.agency_name,
+                    contact_person=r.contact_person,
+                    contact_phone=r.contact_phone,
+                    quantity_available=r.quantity_available,
+                    unit=r.unit,
+                    price=r.price,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
+    return inserted
+
+
+def get_previous_agri_seed_count(session: Session) -> int:
+    """Get record count from the most recent completed agri_seed run."""
+    last_run = session.scalar(
+        select(ScrapeRun)
+        .where(ScrapeRun.subsection_id == "agri", ScrapeRun.status == "completed")
+        .order_by(ScrapeRun.completed_at.desc())
+        .limit(1)
+    )
+    if not last_run:
+        return 0
+    return session.scalar(
+        select(func.count(AgriSeed.id)).where(AgriSeed.scrape_run_id == last_run.id)
+    ) or 0
+
+
+def get_previous_horti_seed_count(session: Session) -> int:
+    """Get record count from the most recent completed horti_seed run."""
+    last_run = session.scalar(
+        select(ScrapeRun)
+        .where(ScrapeRun.subsection_id == "horti", ScrapeRun.status == "completed")
+        .order_by(ScrapeRun.completed_at.desc())
+        .limit(1)
+    )
+    if not last_run:
+        return 0
+    return session.scalar(
+        select(func.count(HortiSeed.id)).where(HortiSeed.scrape_run_id == last_run.id)
+    ) or 0
+
+
+def get_previous_season_seed_count(session: Session) -> int:
+    """Get record count from the most recent completed season_seed run."""
+    last_run = session.scalar(
+        select(ScrapeRun)
+        .where(ScrapeRun.subsection_id == "season", ScrapeRun.status == "completed")
+        .order_by(ScrapeRun.completed_at.desc())
+        .limit(1)
+    )
+    if not last_run:
+        return 0
+    return session.scalar(
+        select(func.count(SeasonSeed.id)).where(SeasonSeed.scrape_run_id == last_run.id)
+    ) or 0
+
+
+# ---------------------------------------------------------------------------
+# Machinery persistence
+# ---------------------------------------------------------------------------
+
+def insert_tractor_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Insert/update Private Tractor Owner records.
+    Upserts on (district_code, block_code, owner_name, machinery_name, scrape_date).
+    Returns count of new rows inserted.
+
+    Uses an in-memory seen set to handle intra-batch duplicates (API may return
+    the same owner across multiple block pages within one scrape run).
+    """
+    inserted = 0
+    seen = set()  # tracks keys added in this batch (not yet flushed to DB)
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if isinstance(r.scraped_at, datetime) else r.scraped_at
+            key = (r.district_code, r.block_code, r.owner_name, r.machinery_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(TractorOwner).where(
+                    TractorOwner.district_code == r.district_code,
+                    TractorOwner.block_code == r.block_code,
+                    TractorOwner.owner_name == r.owner_name,
+                    TractorOwner.machinery_name == r.machinery_name,
+                    TractorOwner.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.mobile_number = r.mobile_number
+                existing.registration_no = r.registration_no
+                existing.maker_model = r.maker_model
+                existing.implement_name = r.implement_name
+            else:
+                session.add(TractorOwner(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    owner_name=r.owner_name,
+                    mobile_number=r.mobile_number,
+                    registration_no=r.registration_no,
+                    maker_model=r.maker_model,
+                    machinery_name=r.machinery_name,
+                    implement_name=r.implement_name,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
+    return inserted
+
+
+def insert_women_plf_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Insert/update Women PLF (Magalir Thittam) machinery hiring records.
+    Upserts on (district_code, block_code, plf_name, scrape_date).
+    Returns count of new rows inserted.
+    """
+    inserted = 0
+    seen = set()
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if isinstance(r.scraped_at, datetime) else r.scraped_at
+            key = (r.district_code, r.block_code, r.plf_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(WomenPLF).where(
+                    WomenPLF.district_code == r.district_code,
+                    WomenPLF.block_code == r.block_code,
+                    WomenPLF.plf_name == r.plf_name,
+                    WomenPLF.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.mobile_number = r.mobile_number
+                existing.contact_address = r.contact_address
+                existing.machinery_procured = r.machinery_procured
+                existing.available_count = r.available_count
+                existing.panchayat = r.panchayat
+            else:
+                session.add(WomenPLF(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    plf_name=r.plf_name,
+                    mobile_number=r.mobile_number,
+                    contact_address=r.contact_address,
+                    machinery_procured=r.machinery_procured,
+                    available_count=r.available_count,
+                    panchayat=r.panchayat,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
+    return inserted
+
+
+def insert_drone_batch(session: Session, records: list, run_id: int) -> int:
+    """
+    Insert/update Drone Owner records.
+    Upserts on (district_code, block_code, owner_name, scrape_date).
+    Returns count of new rows inserted.
+    """
+    inserted = 0
+    seen = set()
+    with session.no_autoflush:
+        for r in records:
+            scrape_date = r.scraped_at.date() if isinstance(r.scraped_at, datetime) else r.scraped_at
+            key = (r.district_code, r.block_code, r.owner_name, scrape_date)
+            if key in seen:
+                continue
+            existing = session.scalar(
+                select(DroneOwner).where(
+                    DroneOwner.district_code == r.district_code,
+                    DroneOwner.block_code == r.block_code,
+                    DroneOwner.owner_name == r.owner_name,
+                    DroneOwner.scrape_date == scrape_date,
+                )
+            )
+            if existing:
+                existing.mobile_number = r.mobile_number
+            else:
+                session.add(DroneOwner(
+                    scrape_run_id=run_id,
+                    district_code=r.district_code,
+                    district_name=r.district_name,
+                    block_code=r.block_code,
+                    block_name=r.block_name,
+                    owner_name=r.owner_name,
+                    mobile_number=r.mobile_number,
+                    scrape_date=scrape_date,
+                ))
+                inserted += 1
+            seen.add(key)
     return inserted
 
 

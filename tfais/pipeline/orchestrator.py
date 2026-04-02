@@ -34,6 +34,8 @@ class Orchestrator:
     # Known sections → controller classes (lazy imports to avoid circular deps)
     SECTIONS = {
         "fertilizer": "tfais.sections.fertilizer.controller.FertilizerController",
+        "seed": "tfais.sections.seed.controller.SeedController",
+        "machinery": "tfais.sections.machinery.controller.MachineryController",
     }
 
     def run(
@@ -82,13 +84,16 @@ class Orchestrator:
                 district_filter=district_filter,
             )
 
-            # Finalize run
+            # Finalize run — results = {"section": ..., "subsections": {name: {...}}}
+            subsections = results.get("subsections", {}) if isinstance(results, dict) else {}
             total_records = sum(
-                r.get("records", 0) for r in results.values()
-                if isinstance(r, dict) and "records" in r
+                r.get("records", 0) if not isinstance(r.get("records"), list)
+                else len(r.get("records", []))
+                for r in subsections.values()
+                if isinstance(r, dict)
             )
             total_errors = sum(
-                1 for r in results.values()
+                1 for r in subsections.values()
                 if isinstance(r, dict) and r.get("status") == "error"
             )
 

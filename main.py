@@ -41,13 +41,14 @@ def main():
     parser = argparse.ArgumentParser(description="TFAIS Scraper Pipeline")
     parser.add_argument(
         "--section",
-        choices=["fertilizer"],
+        choices=["fertilizer", "seed", "machinery"],
         default=None,
         help="Section to scrape (default: fertilizer)",
     )
     parser.add_argument(
         "--subsection",
-        choices=["stock", "price", "biofertilizer"],
+        choices=["stock", "price", "biofertilizer", "agri", "horti", "season",
+                 "tractor", "women_plf", "drone"],
         default=None,
         help="Subsection to scrape within the section",
     )

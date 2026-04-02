@@ -63,7 +63,20 @@
       "Bash(python -m ensurepip --upgrade)",
       "Bash(python -c \"from tfais.config.settings import DATABASE_URL; print\\(DATABASE_URL\\)\")",
       "Bash(psql postgresql://postgres:postgres@localhost:5432/tfais -c \"\\\\dt\")",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(alembic heads:*)",
+      "Bash(wmic logicaldisk:*)",
+      "Bash(alembic -x verbose=true upgrade head)",
+      "Bash(echo \"Exit: $?\")",
+      "WebFetch(domain:115.243.209.84)",
+      "Bash(curl -s -k \"http://115.243.209.84/chc/Mobile/privateOwner/en/20\")",
+      "Bash(curl -s -k \"http://115.243.209.84/chc/Mobile/woman_mechanics/en/20\")",
+      "Bash(curl -s -k \"http://115.243.209.84/chc/Mobile/drone/en/20\")",
+      "Bash(PYTHONIOENCODING=utf-8 python << 'EOF':*)",
+      "Bash(/tmp/api_report.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(/d/Mini-proj/dashboard/myenv/Scripts/python:*)",
+      "Bash(PYTHONIOENCODING=utf-8 /d/Mini-proj/dashboard/myenv/Scripts/python << 'FINAL':*)"
     ],
     "additionalDirectories": [
       "d:\\Mini-proj\\dashboard\\data"

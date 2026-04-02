@@ -22,6 +22,9 @@ def get_engine():
             pool_pre_ping=True,       # detect stale connections
             pool_size=5,
             max_overflow=10,
+            # Set search_path so cross-schema FK references (public.*, fertilizer.*, seed.*)
+            # resolve correctly on every connection from the pool.
+            connect_args={"options": "-c search_path=public,fertilizer,seed,machinery"},
         )
     return _engine
 
