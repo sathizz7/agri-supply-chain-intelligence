@@ -1,6 +1,7 @@
 """
 Seed Section Controller — orchestrates all seed parsers with error isolation.
 """
+import asyncio
 import logging
 from typing import Optional
 
@@ -116,4 +117,69 @@ class SeedController:
                     "anomalies": [],
                 }
 
+        return result
+
+    async def run_async(
+        self,
+        db_session_factory: sessionmaker,
+        run_id: int,
+        subsection_filter: Optional[list[str]] = None,
+        district_filter: Optional[list[str]] = None,
+    ) -> dict:
+        """
+        Run seed parsers concurrently via asyncio.gather().
+        Each parser's run_async() wraps the existing sync run() in a thread,
+        so CSRF/cookie session state is fully preserved.
+        Error isolation is preserved: one parser failure never affects others.
+        """
+        result = {
+            "section": "seed",
+            "subsections": {},
+        }
+
+        parsers_to_run = list(self.PARSERS.keys())
+        if subsection_filter:
+            parsers_to_run = [p for p in parsers_to_run if p in subsection_filter]
+
+        async def _run_one(subsection_name: str) -> tuple[str, dict]:
+            parser_class = self.PARSERS.get(subsection_name)
+            if not parser_class:
+                return subsection_name, {
+                    "status": "error",
+                    "error": f"Unknown subsection: {subsection_name}",
+                    "records": 0, "persisted": 0, "anomalies": [],
+                }
+            try:
+                log.info(f"[async] Running seed parser: {subsection_name}")
+                parser = parser_class()
+                parser_result = await parser.run_async(
+                    db_session_factory, run_id, district_filter=district_filter
+                )
+                log.info(f"{subsection_name}: {parser_result.get('persisted', 0)} records persisted")
+                return subsection_name, {
+                    "status": "completed",
+                    "records": len(parser_result.get("records", [])),
+                    "persisted": parser_result.get("persisted", 0),
+                    "anomalies": parser_result.get("anomalies", []),
+                }
+            except NotImplementedError as e:
+                log.warning(f"{subsection_name}: Not implemented - {e}")
+                return subsection_name, {
+                    "status": "not_implemented",
+                    "error": str(e),
+                    "records": 0, "persisted": 0, "anomalies": [],
+                }
+            except Exception as e:
+                log.error(f"{subsection_name}: Error - {e}", exc_info=True)
+                return subsection_name, {
+                    "status": "error",
+                    "error": str(e),
+                    "records": 0, "persisted": 0, "anomalies": [],
+                }
+
+        task_results = await asyncio.gather(
+            *[_run_one(name) for name in parsers_to_run],
+            return_exceptions=False,  # _run_one catches internally
+        )
+        result["subsections"] = dict(task_results)
         return result

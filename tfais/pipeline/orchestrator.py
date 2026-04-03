@@ -6,6 +6,7 @@ Supports: --section, --subsection, --check-health, and legacy --district mode.
 
 Design ref: docs/modular_HLD.md (Layer 2)
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -127,6 +128,100 @@ class Orchestrator:
                 if run_obj:
                     fail_scrape_run(session, run_obj, notes=str(exc))
             return {"status": "failed", "run_id": run_id, "error": str(exc)}
+
+    async def run_async(
+        self,
+        section: str | None = None,
+        subsection: str | None = None,
+        district_filter: list[str] | None = None,
+    ) -> dict:
+        """
+        Async entry point — mirrors run() but dispatches to controller.run_async().
+
+        DB operations (create/complete/fail scrape run) are sync SQLAlchemy calls
+        wrapped in asyncio.to_thread() so they don't block the event loop.
+        """
+        section = section or "fertilizer"
+        log.info(f"=== TFAIS Async Pipeline Starting: section={section} subsection={subsection} ===")
+
+        if section not in self.SECTIONS:
+            log.error(f"Unknown section: {section}. Available: {list(self.SECTIONS.keys())}")
+            return {"status": "error", "error": f"Unknown section: {section}"}
+
+        # Create scrape run record (sync DB call in thread)
+        run_id = await asyncio.to_thread(self._create_run, section, subsection)
+
+        try:
+            controller = self._get_controller(section)
+            subsection_filter = [subsection] if subsection else None
+
+            results = await controller.run_async(
+                db_session_factory=get_session,
+                run_id=run_id,
+                subsection_filter=subsection_filter,
+                district_filter=district_filter,
+            )
+
+            # Aggregate stats
+            subsections = results.get("subsections", {}) if isinstance(results, dict) else {}
+            total_records = sum(
+                r.get("records", 0) if not isinstance(r.get("records"), list)
+                else len(r.get("records", []))
+                for r in subsections.values()
+                if isinstance(r, dict)
+            )
+            total_errors = sum(
+                1 for r in subsections.values()
+                if isinstance(r, dict) and r.get("status") == "error"
+            )
+
+            await asyncio.to_thread(self._complete_run, run_id, total_records, total_errors)
+
+            summary = {
+                "status": "completed",
+                "run_id": run_id,
+                "section": section,
+                "subsection": subsection,
+                "results": results,
+                "total_records": total_records,
+                "total_errors": total_errors,
+            }
+            log.info(f"=== Async pipeline complete: {summary} ===")
+            return summary
+
+        except Exception as exc:
+            log.critical(f"Async pipeline failed: {exc}", exc_info=True)
+            await asyncio.to_thread(self._fail_run, run_id, str(exc))
+            return {"status": "failed", "run_id": run_id, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # DB helpers — called via asyncio.to_thread so they never block the loop
+    # ------------------------------------------------------------------
+
+    def _create_run(self, section: str, subsection: str | None) -> int:
+        with get_session() as session:
+            run = create_scrape_run(session, trigger_type="manual")
+            run.section_id = section
+            run.subsection_id = subsection
+            return run.id
+
+    def _complete_run(self, run_id: int, total_records: int, total_errors: int) -> None:
+        with get_session() as session:
+            from tfais.database.models import ScrapeRun
+            run_obj = session.get(ScrapeRun, run_id)
+            if run_obj:
+                complete_scrape_run(
+                    session, run_obj,
+                    dealers_scraped=total_records,
+                    errors_count=total_errors,
+                )
+
+    def _fail_run(self, run_id: int, notes: str) -> None:
+        with get_session() as session:
+            from tfais.database.models import ScrapeRun
+            run_obj = session.get(ScrapeRun, run_id)
+            if run_obj:
+                fail_scrape_run(session, run_obj, notes=notes)
 
     def check_health(self) -> None:
         """

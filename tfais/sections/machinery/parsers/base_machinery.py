@@ -7,15 +7,18 @@ Architecture difference from seed parsers:
 - Simpler bootstrap: just fetch districts from JSON endpoint
 - Results come directly as JSON arrays (not embedded in ng-init HTML)
 """
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+import aiohttp
 import requests
 from sqlalchemy.orm import sessionmaker
 
-from tfais.core.http_utils import DEFAULT_HEADERS, rate_limit, retry_request
+from tfais.config.settings import MAX_CONCURRENT_DISTRICTS
+from tfais.core.http_utils import DEFAULT_HEADERS, rate_limit, rate_limit_async, retry_request, retry_request_async
 from tfais.database.operations import (
     insert_anomaly_batch,
     is_checkpoint_done,
@@ -24,6 +27,39 @@ from tfais.database.operations import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level DB helpers for asyncio.to_thread() calls.
+# Each function opens and closes its own session so that session objects never
+# cross thread boundaries.
+# ---------------------------------------------------------------------------
+
+def _check_checkpoint(db_session_factory, run_id, parser_id, key) -> bool:
+    with db_session_factory() as s:
+        return is_checkpoint_done(s, run_id, parser_id, key)
+
+
+def _mark_checkpoint_done(db_session_factory, run_id, parser_id, key, count):
+    with db_session_factory() as s:
+        mark_checkpoint(s, run_id, parser_id, key, status="done", records_found=count)
+        s.commit()
+
+
+def _mark_checkpoint_error(db_session_factory, run_id, parser_id, key, msg):
+    with db_session_factory() as s:
+        mark_checkpoint(s, run_id, parser_id, key, status="error", error_message=msg)
+        s.commit()
+
+
+def _persist_and_finalize(parser, db_session_factory, run_id, all_records, anomalies) -> int:
+    with db_session_factory() as s:
+        persisted = parser.persist(all_records, s, run_id)
+        if anomalies:
+            insert_anomaly_batch(s, run_id, anomalies)
+        upsert_section_metadata(s, parser.section_id, parser.parser_id)
+        s.commit()
+    return persisted
 
 
 class BaseMachineryParser:
@@ -312,3 +348,197 @@ class BaseMachineryParser:
                             status="error", error_message=str(e),
                         )
                         session.commit()
+
+    # ------------------------------------------------------------------
+    # Async methods
+    # ------------------------------------------------------------------
+
+    async def get_districts_async(self, aio_session: aiohttp.ClientSession) -> list[dict]:
+        """Async version of get_districts() using aiohttp."""
+        await rate_limit_async(1.0)
+        async with await retry_request_async(
+            lambda: aio_session.get(self.DISTRICTS_URL, timeout=aiohttp.ClientTimeout(total=30)),
+        ) as resp:
+            resp.raise_for_status()
+            try:
+                data = await resp.json(content_type=None)
+                if not isinstance(data, list):
+                    log.warning(f"{self.parser_id}: Unexpected districts response type")
+                    return []
+                return self._normalize_districts(data)
+            except Exception:
+                log.warning(f"{self.parser_id}: Failed to decode districts JSON")
+                return []
+
+    async def get_blocks_async(
+        self, aio_session: aiohttp.ClientSession, district_id: str
+    ) -> list[dict]:
+        """Async version of get_blocks() using aiohttp."""
+        url = f"{self.BLOCKS_URL}/{district_id}"
+        await rate_limit_async(1.0)
+        async with await retry_request_async(
+            lambda: aio_session.get(url, timeout=aiohttp.ClientTimeout(total=30)),
+        ) as resp:
+            resp.raise_for_status()
+            try:
+                data = await resp.json(content_type=None)
+                if not isinstance(data, list):
+                    return []
+                return self._normalize_blocks(data)
+            except Exception:
+                log.warning(f"{self.parser_id}: Failed to decode blocks JSON for {district_id}")
+                return []
+
+    async def get_results_async(
+        self, aio_session: aiohttp.ClientSession, **kwargs
+    ) -> list[dict]:
+        """
+        Async version of get_results(). Subclasses override with their endpoint.
+        Returns list of raw dicts from the API.
+        """
+        raise NotImplementedError(f"{self.parser_id} must implement get_results_async()")
+
+    async def _process_district_async(
+        self,
+        sem: asyncio.Semaphore,
+        aio_session: aiohttp.ClientSession,
+        district: dict,
+        district_filter: Optional[list[str]],
+        db_session_factory,
+        run_id: int,
+        all_records: list,
+    ) -> None:
+        """Process one district — called concurrently, capped by semaphore."""
+        district_code = district["code"]
+        if district_filter and district_code not in district_filter:
+            return
+
+        async with sem:
+            district_name = district["name"]
+            log.info(f"{self.parser_id}: [async] Processing district {district_code} ({district_name})")
+
+            blocks = await self.get_blocks_async(aio_session, district_code)
+            if not blocks:
+                log.warning(f"{self.parser_id}: No blocks for district {district_code}")
+                return
+
+            for block in blocks:
+                block_code = block["code"]
+                block_name = block["name"]
+                work_unit_key = f"{district_code}:{block_code}"
+
+                done = await asyncio.to_thread(
+                    _check_checkpoint, db_session_factory, run_id, self.parser_id, work_unit_key
+                )
+                if done:
+                    log.debug(f"{self.parser_id}: Skipping done checkpoint {work_unit_key}")
+                    continue
+
+                try:
+                    raw_items = await self.get_results_async(
+                        aio_session,
+                        district_code=district_code,
+                        block_code=block_code,
+                    )
+                    records = self.parse(
+                        raw_items,
+                        district_code=district_code,
+                        district_name=district_name,
+                        block_code=block_code,
+                        block_name=block_name,
+                    )
+                    all_records.extend(records)
+
+                    await asyncio.to_thread(
+                        _mark_checkpoint_done,
+                        db_session_factory, run_id, self.parser_id, work_unit_key, len(records),
+                    )
+                except Exception as e:
+                    log.error(f"{self.parser_id}: Error at {work_unit_key}: {e}")
+                    await asyncio.to_thread(
+                        _mark_checkpoint_error,
+                        db_session_factory, run_id, self.parser_id, work_unit_key, str(e),
+                    )
+
+    async def _iterate_async(
+        self,
+        aio_session: aiohttp.ClientSession,
+        districts: list[dict],
+        district_filter: Optional[list[str]],
+        db_session_factory,
+        run_id: int,
+        all_records: list,
+    ) -> None:
+        """
+        Runs district tasks concurrently, capped at MAX_CONCURRENT_DISTRICTS.
+        DroneOwnersParser overrides this (district-only, no block loop).
+        """
+        sem = asyncio.Semaphore(MAX_CONCURRENT_DISTRICTS)
+        tasks = [
+            asyncio.create_task(
+                self._process_district_async(
+                    sem, aio_session, district, district_filter,
+                    db_session_factory, run_id, all_records,
+                )
+            )
+            for district in districts
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"{self.parser_id}: District task raised: {r}")
+
+    async def run_async(
+        self,
+        db_session_factory,
+        run_id: int,
+        district_filter: Optional[list[str]] = None,
+    ) -> dict:
+        """
+        Full async pipeline: get districts, iterate concurrently, parse, validate, persist.
+        Returns {parser_id, records, persisted, anomalies}.
+        """
+        result = {
+            "parser_id": self.parser_id,
+            "records": [],
+            "persisted": 0,
+            "anomalies": [],
+        }
+        try:
+            async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as aio_session:
+                districts = await self.get_districts_async(aio_session)
+                if not districts:
+                    log.warning(f"{self.parser_id}: No districts returned")
+                    result["anomalies"].append({
+                        "parser_id": self.parser_id,
+                        "anomaly_type": "empty_districts",
+                        "detail": "get_districts_async() returned empty list",
+                        "severity": "error",
+                    })
+                    return result
+
+                all_records: list = []
+                await self._iterate_async(
+                    aio_session, districts, district_filter,
+                    db_session_factory, run_id, all_records,
+                )
+
+            anomalies = self.validate(all_records, prev_count=0)
+            persisted = await asyncio.to_thread(
+                _persist_and_finalize, self, db_session_factory, run_id, all_records, anomalies
+            )
+
+            result["records"] = all_records
+            result["persisted"] = persisted
+            result["anomalies"] = anomalies
+
+        except Exception as e:
+            log.error(f"{self.parser_id}: Fatal error in run_async(): {e}", exc_info=True)
+            result["anomalies"].append({
+                "parser_id": self.parser_id,
+                "anomaly_type": "fatal_error",
+                "detail": str(e),
+                "severity": "error",
+            })
+
+        return result

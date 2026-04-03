@@ -13,6 +13,7 @@ Usage:
 Logging is written to both stdout and logs/tfais.log.
 """
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -113,10 +114,12 @@ def main():
     if args.district and not subsection:
         subsection = "stock"
 
-    result = orch.run(
-        section=args.section,
-        subsection=subsection,
-        district_filter=args.district,
+    result = asyncio.run(
+        orch.run_async(
+            section=args.section,
+            subsection=subsection,
+            district_filter=args.district,
+        )
     )
 
     print("\n=== Run Summary ===")

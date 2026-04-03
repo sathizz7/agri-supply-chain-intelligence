@@ -11,6 +11,7 @@ Design ref: docs/subsection_parser_logic.md (Section 1)
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -163,6 +164,21 @@ class StockPositionParser:
             "persisted": count,
             "anomalies": anomalies,
         }
+
+    async def run_async(
+        self,
+        db_session_factory,
+        run_id: int,
+        district_filter: list[str] | None = None,
+    ) -> dict:
+        """
+        Async entry point — wraps the synchronous run() in a thread pool worker.
+
+        StockPositionParser uses a stateful requests.Session (CSRF tokens,
+        hidden fields), so we preserve the session logic unchanged inside the
+        thread rather than rewriting to aiohttp.
+        """
+        return await asyncio.to_thread(self.run, db_session_factory, run_id, district_filter)
 
     # ------------------------------------------------------------------
     # HTTP: Bootstrap

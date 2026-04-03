@@ -8,6 +8,7 @@ Shared logic:
 - Checkpoint management
 - Validation and persistence
 """
+import asyncio
 import json
 import logging
 import re
@@ -337,3 +338,154 @@ class BaseAngularSeedParser:
         Must be overridden by AgriSeedParser, HortiSeedParser, SeasonSeedParser.
         """
         raise NotImplementedError(f"{self.parser_id} must implement _fetch_and_parse_block()")
+
+    async def run_async(
+        self,
+        db_session_factory,
+        run_id: int,
+        district_filter: Optional[list[str]] = None,
+    ) -> dict:
+        """
+        Async entry point with district-level concurrency.
+
+        Strategy:
+        1. Bootstrap once in a thread to get the district list (and crops/seasons
+           for subclasses that extract them during bootstrap).
+        2. Spawn one asyncio.to_thread task per district, capped by
+           MAX_CONCURRENT_DISTRICTS via asyncio.Semaphore.
+        3. Each district task creates a fresh requests.Session so CSRF cookies
+           are isolated between concurrent workers.
+
+        All checkpoint, validation, and persistence logic is preserved.
+        """
+        from tfais.config.settings import MAX_CONCURRENT_DISTRICTS
+        from tfais.sections.machinery.parsers.base_machinery import (
+            _check_checkpoint,
+            _mark_checkpoint_done,
+            _mark_checkpoint_error,
+        )
+
+        result = {
+            "parser_id": self.parser_id,
+            "records": [],
+            "persisted": 0,
+            "anomalies": [],
+        }
+
+        try:
+            # --- Step 1: Bootstrap in a thread (extracts district list, crops, seasons, etc.) ---
+            await asyncio.to_thread(self.bootstrap)
+            if not self.districts:
+                log.warning(f"{self.parser_id}: No districts after bootstrap")
+                result["anomalies"].append({
+                    "parser_id": self.parser_id,
+                    "anomaly_type": "empty_districts",
+                    "detail": "bootstrap() returned no districts",
+                    "severity": "error",
+                })
+                return result
+
+            # Snapshot subclass state that district workers need (crops, seasons, etc.)
+            # Workers call _clone_for_district() to get an isolated copy of this parser.
+            all_records: list = []
+            sem = asyncio.Semaphore(MAX_CONCURRENT_DISTRICTS)
+
+            # --- Step 2: Per-district concurrent tasks ---
+            async def _process_district(district: dict) -> None:
+                district_code = district.get("code")
+                if district_filter and district_code not in district_filter:
+                    return
+
+                async with sem:
+                    district_name = district.get("name_en", "")
+                    log.info(f"{self.parser_id}: [async] Processing district {district_code}")
+
+                    # Bootstrap worker + get blocks in one thread call so the blocking
+                    # HTTP in _clone_for_district never runs on the event loop thread.
+                    def _bootstrap_and_get_blocks():
+                        worker = self._clone_for_district()
+                        return worker, worker.get_blocks(district_code)
+
+                    worker, blocks = await asyncio.to_thread(_bootstrap_and_get_blocks)
+                    if not blocks:
+                        log.warning(f"{self.parser_id}: No blocks for district {district_code}")
+                        return
+
+                    for block in blocks:
+                        block_code = block.get("code", "")
+                        block_name = block.get("name_en", "")
+                        work_unit_key = f"district:{district_code}:block:{block_code}"
+
+                        done = await asyncio.to_thread(
+                            _check_checkpoint, db_session_factory, run_id, self.parser_id, work_unit_key
+                        )
+                        if done:
+                            log.debug(f"{self.parser_id}: Skipping done checkpoint {work_unit_key}")
+                            continue
+
+                        try:
+                            records = await asyncio.to_thread(
+                                worker._fetch_and_parse_block,
+                                district_code, district_name, block_code, block_name,
+                            )
+                            all_records.extend(records)
+                            await asyncio.to_thread(
+                                _mark_checkpoint_done,
+                                db_session_factory, run_id, self.parser_id, work_unit_key, len(records),
+                            )
+                        except Exception as e:
+                            log.error(f"{self.parser_id}: Error at {work_unit_key}: {e}")
+                            await asyncio.to_thread(
+                                _mark_checkpoint_error,
+                                db_session_factory, run_id, self.parser_id, work_unit_key, str(e),
+                            )
+
+            tasks = [asyncio.create_task(_process_district(d)) for d in self.districts]
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in gathered:
+                if isinstance(r, Exception):
+                    log.error(f"{self.parser_id}: District task raised: {r}")
+
+            # --- Step 3: Validate + persist ---
+            with db_session_factory() as session:
+                prev_count = self.get_previous_count(session)
+            all_anomalies = self.validate(all_records, prev_count)
+
+            with db_session_factory() as session:
+                persisted = self.persist(all_records, session, run_id)
+                if all_anomalies:
+                    from tfais.database.operations import insert_anomaly_batch
+                    insert_anomaly_batch(session, run_id, all_anomalies)
+                from tfais.database.operations import upsert_section_metadata
+                upsert_section_metadata(session, self.section_id, self.parser_id)
+                session.commit()
+
+            result["records"] = all_records
+            result["persisted"] = persisted
+            result["anomalies"] = all_anomalies
+
+        except Exception as e:
+            log.error(f"{self.parser_id}: Fatal error in run_async(): {e}", exc_info=True)
+            result["anomalies"].append({
+                "parser_id": self.parser_id,
+                "anomaly_type": "fatal_error",
+                "detail": str(e),
+                "severity": "error",
+            })
+
+        return result
+
+    def _clone_for_district(self):
+        """
+        Create a fresh parser instance with its own bootstrapped requests.Session.
+
+        Each concurrent district worker needs an isolated session so CSRF cookies
+        don't bleed between workers.  Calling bootstrap() re-establishes the
+        ci_session cookie and repopulates subclass state (crops, seasons, etc.).
+        """
+        worker = self.__class__()
+        try:
+            worker.bootstrap()
+        except Exception as e:
+            log.warning(f"{self.parser_id}: Worker bootstrap failed: {e}")
+        return worker

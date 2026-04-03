@@ -15,12 +15,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import asyncio
+
+import aiohttp
+
 from tfais.config.settings import (
     MACHINERY_DISTRICTS_URL,
     MACHINERY_DRONE_RESULTS_URL,
     MACHINERY_RATE_LIMIT,
+    MAX_CONCURRENT_DISTRICTS,
 )
-from tfais.core.http_utils import rate_limit, retry_request
+from tfais.core.http_utils import rate_limit, rate_limit_async, retry_request, retry_request_async
 from tfais.database.operations import (
     is_checkpoint_done,
     mark_checkpoint,
@@ -95,6 +100,23 @@ class DroneOwnersParser(BaseMachineryParser):
 
         return records
 
+    async def get_results_async(
+        self, aio_session: aiohttp.ClientSession, district_code: str = None, **kwargs
+    ) -> list[dict]:
+        """Async GET /loadDrone/{district_id}"""
+        url = f"{self.RESULTS_URL}/{district_code}"
+        await rate_limit_async(MACHINERY_RATE_LIMIT)
+        async with await retry_request_async(
+            lambda: aio_session.get(url, timeout=aiohttp.ClientTimeout(total=30)),
+        ) as resp:
+            resp.raise_for_status()
+            try:
+                data = await resp.json(content_type=None)
+                return data if isinstance(data, list) else []
+            except Exception:
+                log.warning(f"{self.parser_id}: Failed to decode results JSON for district {district_code}")
+                return []
+
     def persist(self, records: list[DroneRecord], session, run_id: int) -> int:
         from tfais.database.operations import insert_drone_batch
         return insert_drone_batch(session, records, run_id)
@@ -150,3 +172,58 @@ class DroneOwnersParser(BaseMachineryParser):
                         status="error", error_message=str(e),
                     )
                     session.commit()
+
+    async def _iterate_async(
+        self,
+        aio_session: aiohttp.ClientSession,
+        districts: list[dict],
+        district_filter,
+        db_session_factory,
+        run_id: int,
+        all_records: list,
+    ) -> None:
+        """
+        Override: district-only concurrent iteration.
+        Checkpoint key: "district:{district_code}"
+        """
+        from .base_machinery import _check_checkpoint, _mark_checkpoint_done, _mark_checkpoint_error
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT_DISTRICTS)
+
+        async def _process(district: dict) -> None:
+            district_code = district["code"]
+            if district_filter and district_code not in district_filter:
+                return
+
+            async with sem:
+                district_name = district["name"]
+                work_unit_key = f"district:{district_code}"
+
+                log.info(f"{self.parser_id}: [async] Processing district {district_code} ({district_name})")
+
+                done = await asyncio.to_thread(
+                    _check_checkpoint, db_session_factory, run_id, self.parser_id, work_unit_key
+                )
+                if done:
+                    log.debug(f"{self.parser_id}: Skipping done checkpoint {work_unit_key}")
+                    return
+
+                try:
+                    raw_items = await self.get_results_async(aio_session, district_code=district_code)
+                    records = self.parse(raw_items, district_code=district_code, district_name=district_name)
+                    all_records.extend(records)
+                    await asyncio.to_thread(
+                        _mark_checkpoint_done,
+                        db_session_factory, run_id, self.parser_id, work_unit_key, len(records),
+                    )
+                except Exception as e:
+                    log.error(f"{self.parser_id}: Error at {work_unit_key}: {e}")
+                    await asyncio.to_thread(
+                        _mark_checkpoint_error,
+                        db_session_factory, run_id, self.parser_id, work_unit_key, str(e),
+                    )
+
+        results = await asyncio.gather(*[_process(d) for d in districts], return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"{self.parser_id}: District task raised: {r}")

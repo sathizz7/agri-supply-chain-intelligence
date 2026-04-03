@@ -23,13 +23,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import aiohttp
+
 from tfais.config.settings import (
     MACHINERY_RATE_LIMIT,
     MACHINERY_WDS_BLOCKS_URL,
     MACHINERY_WDS_DISTRICTS_URL,
     MACHINERY_WDS_RESULTS_URL,
 )
-from tfais.core.http_utils import rate_limit, retry_request
+from tfais.core.http_utils import rate_limit, rate_limit_async, retry_request, retry_request_async
 
 from .base_machinery import BaseMachineryParser
 
@@ -107,6 +109,23 @@ class WomenPLFParser(BaseMachineryParser):
                 continue
 
         return records
+
+    async def get_results_async(
+        self, aio_session: aiohttp.ClientSession, district_code: str = None, block_code: str = None, **kwargs
+    ) -> list[dict]:
+        """Async GET /getWDCMechanics/{block_id}"""
+        url = f"{self.RESULTS_URL}/{block_code}"
+        await rate_limit_async(MACHINERY_RATE_LIMIT)
+        async with await retry_request_async(
+            lambda: aio_session.get(url, timeout=aiohttp.ClientTimeout(total=30)),
+        ) as resp:
+            resp.raise_for_status()
+            try:
+                data = await resp.json(content_type=None)
+                return data if isinstance(data, list) else []
+            except Exception:
+                log.warning(f"{self.parser_id}: Failed to decode results JSON for block {block_code}")
+                return []
 
     def persist(self, records: list[WomenPLFRecord], session, run_id: int) -> int:
         from tfais.database.operations import insert_women_plf_batch
